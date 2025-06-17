@@ -31,7 +31,8 @@ This is the core script for applying security settings.
 * **Disk Encryption:** Enables BitLocker on the system drive.  
 * **LAPS Configuration:** Configures the Windows Local Administrator Password Solution (LAPS).  
 * **Verification:** Checks that each configuration was applied successfully.  
-* **Rollback File:** Generates a hardening-state.json file to enable the undo script.
+* **Rollback File:** Generates a hardening-state.json file to enable the undo script.  
+* **Compliance Data Collection:** Gathers extensive system, security, and event log data into JSON files (system-baseline.json, compliance-verification.json, security-events.json) for auditing and verification.
 
 #### **Usage**
 
@@ -44,7 +45,7 @@ This is the core script for applying security settings.
    \# Run while demoting existing local admins  
    .\\Unified-Hardening.ps1 \-UsersToDemote "OldAdmin", "TempUser"
 
-4. **Completion:** Once the script finishes, it will have created a folder named PC-\<ComputerName\>-LOGS on your drive. Eject and secure the drive immediately.
+4. **Completion:** Once the script finishes, it will have created a folder named PC-\<ComputerName\>-LOGS on your drive containing the log file, the undo state file, and the compliance JSON files. Eject and secure the drive immediately.
 
 ### **Part 2: The Rollback Script (Undo-Hardening.ps1)**
 
