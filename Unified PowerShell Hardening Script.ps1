@@ -117,9 +117,131 @@ Write-SecLog "Master harden script started."
 
 # --- 1. ADMIN ACCOUNTS ---
 Write-Host "[1] Managing Administrator Accounts..." -ForegroundColor Green
-# ... (rest of the hardening steps 1-7 remain here)
+try {
+    $undoState.DemotedAdmins = $UsersToDemote
+    if (-not (Get-LocalUser -Name $config.NewAdminName -ErrorAction SilentlyContinue)) {
+        $password = New-StrongPassword -Length $config.PasswordLength
+        net user $config.NewAdminName $password /add /expires:never /passwordchg:no
+        net localgroup Administrators $config.NewAdminName /add
+        if ((Get-LocalGroupMember -Group 'Administrators').Name -contains $config.NewAdminName) {
+            Write-Host "  [VERIFIED] Created and promoted local admin '$($config.NewAdminName)'." -ForegroundColor Green
+            Write-SecLog "Created '$($config.NewAdminName)'. ==> PASSWORD: $password"
+        } else {
+            Write-Warning "  [FAILED] Could not verify '$($config.NewAdminName)' was added to Administrators."
+            Write-SecLog "[ERROR] Failed to verify promotion of '$($config.NewAdminName)'."
+        }
+    } else { Write-Host "  [INFO] User '$($config.NewAdminName)' already exists. Skipping creation." -ForegroundColor Yellow }
 
-# --- 8. DISABLE REMOTE ACCESS SERVICES ---
+    foreach ($user in $UsersToDemote) {
+        $user = $user.Trim()
+        if ($user -and ($user -ne $config.NewAdminName) -and ($user -ne "Administrator")) {
+            net localgroup Administrators $user /delete
+            if (-not ((Get-LocalGroupMember -Group 'Administrators').Name -contains $user)) {
+                Write-Host "  [VERIFIED] Demoted user '$user'." -ForegroundColor Green
+                Write-SecLog "Demoted user: $user"
+            } else { Write-Warning "  [FAILED] Could not verify demotion of user '$user'." }
+        }
+    }
+} catch { Write-Warning "  - Admin account management error: $_"; Write-SecLog "[ERROR] Admin management failed: $_" }
+
+# --- 2. DEFENDER HARDENING ---
+Write-Host "[2] Hardening Microsoft Defender..." -ForegroundColor Green
+try {
+    Set-MpPreference -EnableTamperProtection 1 -EnableControlledFolderAccess Enabled
+    $asrRuleIds = @("56a863a9-875e-4185-98a7-b882c64b5ce5", "3b576869-a4ec-4529-8536-b80a7769e899", "d4f940ab-401b-4efc-aadc-ad5f3c50688a", "9e6c285a-c97e-4ad4-a890-1ce04d5e0674", "c1db55ab-c21a-4637-bb3f-a12568109d35", "92e97fa1-2edf-4476-bdd6-9dd38f7c9c35")
+    Set-MpPreference -AttackSurfaceReductionRules_Ids $asrRuleIds -AttackSurfaceReductionRules_Actions Enabled
+    $prefs = Get-MpPreference
+    if ($prefs.EnableTamperProtection -and $prefs.EnableControlledFolderAccess -eq 1) {
+        Write-Host "  [VERIFIED] Tamper Protection and Controlled Folder Access are enabled." -ForegroundColor Green
+        $undoState.DefenderHardened = $true; Write-SecLog "Defender hardened successfully."
+    } else { Write-Warning "  [FAILED] Could not verify Defender preferences were set." }
+} catch { Write-Warning "  - Defender hardening error: $_"; Write-SecLog "[ERROR] Defender hardening failed: $_" }
+
+# --- 3. BITLOCKER ENCRYPTION ---
+Write-Host "[3] Managing BitLocker Encryption..." -ForegroundColor Green
+try {
+    $vol = Get-BitLockerVolume -MountPoint "C:"
+    if ($vol.VolumeStatus -eq 'FullyDecrypted') {
+        Write-Host "  - Enabling BitLocker on C:."
+        manage-bde -on C: -skiphardwaretest
+        Start-Sleep -Seconds 10
+        $volAfter = Get-BitLockerVolume -MountPoint "C:"
+        if ($volAfter.ProtectionStatus -eq 'On' -or $volAfter.VolumeStatus -eq 'Encrypting') {
+            $recKey = (manage-bde -protectors -get C: | Select-String 'Numerical Password' -Context 0,1).Context.PostContext[0].Trim()
+            Write-Host "  [VERIFIED] BitLocker encryption is active on C:. Recovery key saved." -ForegroundColor Green
+            Write-SecLog "BitLocker enabled. ==> RECOVERY KEY: $recKey"; $undoState.BitLockerEnabled = $true
+        } else { Write-Warning "  [FAILED] BitLocker failed to start encryption process." }
+    } else { Write-Host "  [INFO] BitLocker is already active on C: ($($vol.VolumeStatus))." -ForegroundColor Yellow }
+} catch { Write-Warning "  - BitLocker error: $_"; Write-SecLog "[ERROR] BitLocker failed: $_" }
+
+# --- 4. LAPS CONFIGURATION ---
+Write-Host "[4] Configuring LAPS..." -ForegroundColor Green
+try {
+    Set-LapsPolicy -Enable 1 -AdminAccountName $config.LapsAdminAccount -PasswordComplexity 4 -PasswordLength 15 -PasswordAgeDays 30
+    if ((Get-LapsPolicy).Enable -eq 1) {
+        $exp = (Get-LapsDiagnostics).ExpirationTimestamp
+        Write-Host "  [VERIFIED] LAPS policy is enabled. Next rotation: $exp" -ForegroundColor Green
+        Write-SecLog "LAPS enabled for '$($config.LapsAdminAccount)'."; $undoState.LapsConfigured = $true
+    } else { Write-Warning "  [FAILED] Could not verify LAPS policy was enabled." }
+} catch { Write-Warning "  - LAPS configuration error: $_"; Write-SecLog "[ERROR] LAPS configuration failed: $_" }
+
+# --- 5. INSTALL AGENTS ---
+Write-Host "[5] Checking for optional agents (Wazuh, Sysmon)..." -ForegroundColor Green
+$wazuhMsi = Get-ChildItem (Join-Path $PSScriptRoot 'wazuh-agent*.msi') -EA SilentlyContinue | Select -F 1
+if ($wazuhMsi) {
+    Write-Host "  - Found Wazuh installer. Installing..."
+    try {
+        Start-Process msiexec -ArgumentList "/i `"$($wazuhMsi.FullName)`" /qn WAZUH_MANAGER='$WazuhManagerIP'" -Wait
+        if (Get-Service -Name 'WazuhSvc' -EA SilentlyContinue) {
+            Write-Host "  [VERIFIED] Wazuh service is present." -ForegroundColor Green
+            Write-SecLog "Wazuh agent installed."; $undoState.WazuhInstalled = $wazuhMsi.FullName
+        } else { Write-Warning "  [FAILED] Wazuh service not found after installation." }
+    } catch { Write-Warning "  - Wazuh install failed: $_"; Write-SecLog "[ERROR] Wazuh install failed: $_" }
+}
+$sysmonExe=Join-Path $PSScriptRoot 'Sysmon64.exe'; $sysmonXml=Join-Path $PSScriptRoot 'sysmon.xml'
+if ((Test-Path $sysmonExe) -and (Test-Path $sysmonXml)) {
+    Write-Host "  - Found Sysmon. Installing..."
+    try { 
+        & $sysmonExe -accepteula -i $sysmonXml
+        if (Get-Service -Name 'Sysmon64' -EA SilentlyContinue) {
+            Write-Host "  [VERIFIED] Sysmon service is present." -ForegroundColor Green
+            Write-SecLog "Sysmon installed."; $undoState.SysmonInstalled = $true
+        } else { Write-Warning "  [FAILED] Sysmon service not found after installation." }
+    } catch { Write-Warning "  - Sysmon install failed: $_"; Write-SecLog "[ERROR] Sysmon install failed: $_" }
+}
+
+# --- 6. WDAC POLICY ---
+Write-Host "[6] Checking for optional WDAC policy..." -ForegroundColor Green
+$wdacPolicyBinary = "$env:SystemRoot\System32\CodeIntegrity\SIPolicy.p7b"
+if (-not(Test-Path $wdacPolicyBinary)) {
+    $wdacPolicyXml = Join-Path $PSScriptRoot 'WDAC_Policy.xml'
+    if (Test-Path $wdacPolicyXml) {
+        Write-Host "  - Found WDAC policy. Applying..."
+        try {
+            ConvertFrom-CIPolicy -XmlFilePath $wdacPolicyXml -BinaryFilePath $wdacPolicyBinary
+            if (Test-Path $wdacPolicyBinary) {
+                Write-Host "  [VERIFIED] WDAC policy binary created successfully." -ForegroundColor Green
+                Write-SecLog "WDAC policy applied."; $undoState.WDACApplied = $true
+            } else { Write-Warning "  [FAILED] Could not find WDAC policy binary after conversion." }
+        } catch { Write-Warning "  - WDAC policy application failed: $_"; Write-SecLog "[ERROR] WDAC failed: $_" }
+    }
+} else { Write-Host "  [INFO] WDAC policy already exists. Skipping." -ForegroundColor Yellow }
+
+# --- 7. FIREWALL HARDENING ---
+Write-Host "[7] Hardening Windows Firewall..." -ForegroundColor Green
+try {
+    netsh advfirewall set allprofiles firewallpolicy blockoutbound,allowinbound
+    foreach ($rule in $config.FirewallAllowRules) {
+        netsh advfirewall firewall add rule name="$($rule.Name)" dir=out action=allow protocol="$($rule.Protocol)" remoteport="$($rule.Port)" | Out-Null
+    }
+    $profiles = Get-NetFirewallProfile
+    if (($profiles | Where-Object {$_.DefaultOutboundAction -eq 'Block'}).Count -eq $profiles.Count) {
+        Write-Host "  [VERIFIED] All firewall profiles are set to Block Outbound by default." -ForegroundColor Green
+        Write-SecLog "Firewall hardened."; $undoState.FirewallHardened = $true
+    } else { Write-Warning "  [FAILED] Not all firewall profiles are set to Block Outbound." }
+} catch { Write-Warning "  - Firewall hardening error: $_"; Write-SecLog "[ERROR] Firewall hardening failed: $_" }
+
+# --- 8. DISABLE REMOTE ACCESS ---
 Write-Host "[8] Disabling remote access services..." -ForegroundColor Green
 try {
     Stop-Service -Name 'WinRM' -Force -ErrorAction SilentlyContinue
@@ -128,7 +250,6 @@ try {
     Stop-Service -Name 'TermService' -Force -ErrorAction SilentlyContinue
     Get-NetFirewallRule -DisplayName "*Remote Desktop*" | Disable-NetFirewallRule -ErrorAction SilentlyContinue
     
-    # VERIFICATION
     $winrmStopped = (Get-Service -Name 'WinRM' -ErrorAction SilentlyContinue).Status -eq 'Stopped'
     $rdpDisabled = (Get-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -ErrorAction SilentlyContinue).fDenyTSConnections -eq 1
     
@@ -145,7 +266,7 @@ try {
     Write-SecLog "[ERROR] Remote access disabling failed: $_"
 }
 
-# --- DATA COLLECTION FOR COMPLIANCE VERIFICATION ---
+# --- DATA COLLECTION ---
 Write-Host "`n[DATA] Collecting compliance verification data..." -ForegroundColor Magenta
 try {
     Export-SystemBaseline
@@ -160,7 +281,7 @@ try {
     Write-SecLog "[ERROR] Data collection failed: $_"
 }
 
-# --- FINALIZATION: SAVE STATE FILE ---
+# --- FINALIZATION ---
 Write-Host "`n[FINAL] Finalizing and saving undo state..." -ForegroundColor Cyan
 try {
     $stateFilePath = Join-Path $logFolder $config.StateFileName
