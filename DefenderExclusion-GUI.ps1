@@ -6,9 +6,6 @@
     This script launches a simple user interface to help administrators whitelist or remove
     exclusions for trusted applications or folders. It requires administrative privileges
     and logs all actions.
-.NOTES
-    Author: Gemini
-    Version: 2.0
 #>
 
 # --- Initial Setup and Admin Check ---
@@ -36,63 +33,54 @@ function Write-ExclusionLog {
 # --- GUI FORM DEFINITION ---
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Defender Whitelist Tool"
-$form.Size = New-Object System.Drawing.Size(500, 310) # Increased height for new button
+$form.Size = New-Object System.Drawing.Size(500, 310)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 
 # --- GUI CONTROLS ---
-
-# Label for instructions
 $label = New-Object System.Windows.Forms.Label
 $label.Location = New-Object System.Drawing.Point(10, 10)
 $label.Size = New-Object System.Drawing.Size(460, 30)
 $label.Text = "Browse for a file (.exe) or a folder to add to or remove from the Defender exclusion lists."
 $form.Controls.Add($label)
 
-# Textbox to display selected path
 $textBox = New-Object System.Windows.Forms.TextBox
 $textBox.Location = New-Object System.Drawing.Point(10, 45)
 $textBox.Size = New-Object System.Drawing.Size(350, 20)
 $textBox.ReadOnly = $true
 $form.Controls.Add($textBox)
 
-# Browse for File button
 $browseFileButton = New-Object System.Windows.Forms.Button
 $browseFileButton.Location = New-Object System.Drawing.Point(370, 43)
 $browseFileButton.Size = New-Object System.Drawing.Size(100, 25)
 $browseFileButton.Text = "Browse File..."
 $form.Controls.Add($browseFileButton)
 
-# Browse for Folder button
 $browseFolderButton = New-Object System.Windows.Forms.Button
 $browseFolderButton.Location = New-Object System.Drawing.Point(370, 73)
 $browseFolderButton.Size = New-Object System.Drawing.Size(100, 25)
 $browseFolderButton.Text = "Browse Folder..."
 $form.Controls.Add($browseFolderButton)
 
-# Add to Whitelist button
 $addButton = New-Object System.Windows.Forms.Button
 $addButton.Location = New-Object System.Drawing.Point(10, 110)
 $addButton.Size = New-Object System.Drawing.Size(460, 40)
 $addButton.Text = "ADD TO WHITELIST"
 $addButton.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $addButton.BackColor = [System.Drawing.Color]::LightGreen
-$addButton.Enabled = $false # Disabled until a path is selected
+$addButton.Enabled = $false
 $form.Controls.Add($addButton)
 
-# Remove from Whitelist button
 $removeButton = New-Object System.Windows.Forms.Button
 $removeButton.Location = New-Object System.Drawing.Point(10, 155)
 $removeButton.Size = New-Object System.Drawing.Size(460, 40)
 $removeButton.Text = "REMOVE FROM WHITELIST"
 $removeButton.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $removeButton.BackColor = [System.Drawing.Color]::LightCoral
-$removeButton.Enabled = $false # Disabled until a path is selected
+$removeButton.Enabled = $false
 $form.Controls.Add($removeButton)
 
-
-# Status label
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Location = New-Object System.Drawing.Point(10, 205)
 $statusLabel.Size = New-Object System.Drawing.Size(460, 50)
@@ -101,8 +89,7 @@ $statusLabel.ForeColor = [System.Drawing.Color]::DimGray
 $statusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $form.Controls.Add($statusLabel)
 
-# --- EVENT HANDLERS (Button Clicks) ---
-
+# --- EVENT HANDLERS ---
 $onPathSelected = {
     $textBox.Text = $path
     $addButton.Enabled = $true
@@ -115,83 +102,54 @@ $browseFileButton.Add_Click({
     $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
     $openFileDialog.Filter = "Executable Files (*.exe)|*.exe|All files (*.*)|*.*"
     $openFileDialog.Title = "Select an Application"
-    if ($openFileDialog.ShowDialog() -eq "OK") {
-        $script:path = $openFileDialog.FileName
-        . $onPathSelected
-    }
+    if ($openFileDialog.ShowDialog() -eq "OK") { $script:path = $openFileDialog.FileName; . $onPathSelected }
 })
 
 $browseFolderButton.Add_Click({
     $folderBrowserDialog = New-Object System.Windows.Forms.FolderBrowserDialog
     $folderBrowserDialog.Description = "Select a Folder"
-    if ($folderBrowserDialog.ShowDialog() -eq "OK") {
-        $script:path = $folderBrowserDialog.SelectedPath
-        . $onPathSelected
-    }
+    if ($folderBrowserDialog.ShowDialog() -eq "OK") { $script:path = $folderBrowserDialog.SelectedPath; . $onPathSelected }
 })
 
 $addButton.Add_Click({
-    $path = $textBox.Text
-    if ([string]::IsNullOrWhiteSpace($path)) { return }
-
-    $statusLabel.Text = "Status: Processing ADD request..."
-    $statusLabel.ForeColor = [System.Drawing.Color]::Blue
-    $form.Update()
-
+    $path = $textBox.Text; if ([string]::IsNullOrWhiteSpace($path)) { return }
+    $statusLabel.Text = "Status: Processing ADD request..."; $statusLabel.ForeColor = [System.Drawing.Color]::Blue; $form.Update()
     try {
         Add-MpPreference -AttackSurfaceReductionOnlyExclusions $path -ErrorAction Stop
         Write-ExclusionLog -Text "ASR exclusion ADDED for path: $path"
-
         if ($path -like "*.exe") {
             Add-MpPreference -ControlledFolderAccessAllowedApplications $path -ErrorAction Stop
             Write-ExclusionLog -Text "CFA exclusion ADDED for application: $path"
         }
-
-        $statusLabel.Text = "Status: Successfully ADDED exclusion for '$path'."
-        $statusLabel.ForeColor = [System.Drawing.Color]::Green
+        $statusLabel.Text = "Status: Successfully ADDED exclusion for '$path'."; $statusLabel.ForeColor = [System.Drawing.Color]::Green
         [System.Windows.Forms.MessageBox]::Show("The exclusion was successfully added.", "Success", "OK", "Information")
-
-    }
-    catch {
+    } catch {
         $errorMessage = "An error occurred while ADDING the exclusion: $($_.Exception.Message)"
-        $statusLabel.Text = "Status: $errorMessage"
-        $statusLabel.ForeColor = [System.Drawing.Color]::Red
+        $statusLabel.Text = "Status: $errorMessage"; $statusLabel.ForeColor = [System.Drawing.Color]::Red
         Write-ExclusionLog -Text "[ERROR] Failed to ADD exclusion for '$path'. Details: $_"
         [System.Windows.Forms.MessageBox]::Show($errorMessage, "Error", "OK", "Error")
     }
 })
 
 $removeButton.Add_Click({
-    $path = $textBox.Text
-    if ([string]::IsNullOrWhiteSpace($path)) { return }
-    
-    $statusLabel.Text = "Status: Processing REMOVE request..."
-    $statusLabel.ForeColor = [System.Drawing.Color]::Blue
-    $form.Update()
-
+    $path = $textBox.Text; if ([string]::IsNullOrWhiteSpace($path)) { return }
+    $statusLabel.Text = "Status: Processing REMOVE request..."; $statusLabel.ForeColor = [System.Drawing.Color]::Blue; $form.Update()
     try {
         Remove-MpPreference -AttackSurfaceReductionOnlyExclusions $path -ErrorAction Stop
         Write-ExclusionLog -Text "ASR exclusion REMOVED for path: $path"
-
         if ($path -like "*.exe") {
             Remove-MpPreference -ControlledFolderAccessAllowedApplications $path -ErrorAction Stop
             Write-ExclusionLog -Text "CFA exclusion REMOVED for application: $path"
         }
-
-        $statusLabel.Text = "Status: Successfully REMOVED exclusion for '$path'."
-        $statusLabel.ForeColor = [System.Drawing.Color]::DarkGreen
+        $statusLabel.Text = "Status: Successfully REMOVED exclusion for '$path'."; $statusLabel.ForeColor = [System.Drawing.Color]::DarkGreen
         [System.Windows.Forms.MessageBox]::Show("The exclusion was successfully removed.", "Success", "OK", "Information")
-
-    }
-    catch {
+    } catch {
         $errorMessage = "An error occurred while REMOVING the exclusion: $($_.Exception.Message)"
-        $statusLabel.Text = "Status: $errorMessage"
-        $statusLabel.ForeColor = [System.Drawing.Color]::Red
+        $statusLabel.Text = "Status: $errorMessage"; $statusLabel.ForeColor = [System.Drawing.Color]::Red
         Write-ExclusionLog -Text "[ERROR] Failed to REMOVE exclusion for '$path'. Details: $_"
         [System.Windows.Forms.MessageBox]::Show($errorMessage, "Error", "OK", "Error")
     }
 })
 
-
-# --- Display the Form ---
+# --- Display Form ---
 $form.ShowDialog() | Out-Null
