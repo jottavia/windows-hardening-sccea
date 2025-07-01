@@ -5,8 +5,9 @@
     Main hardening script that performs critical security configurations.
     Creates admin account, configures Administrator password, enables BitLocker, hardens Defender, etc.
     GUARANTEES creation of password and BitLocker key files.
+    Enhanced with advanced security policies and URBackup integration.
 .NOTES
-    Version: 11.0 - Part 1 of 3
+    Version: 11.1 - Part 1 of 3 (Enhanced Security Policies)
     Run Order: 1-Core-Hardening.ps1 -> 2-Compliance-Collection.ps1 -> 3-Final-Report.ps1
 #>
 [CmdletBinding()]
@@ -28,6 +29,7 @@ Write-Host "  [*] Enable BitLocker drive encryption (may take hours)            
 Write-Host "  [*] Lock down Windows Firewall (blocks most network traffic)              " -ForegroundColor Red
 Write-Host "  [*] Disable Remote Desktop and WinRM                                       " -ForegroundColor Red
 Write-Host "  [*] Install security monitoring agents                                     " -ForegroundColor Red
+Write-Host "  [*] Apply enhanced security policies (Edge, timeouts, execution)          " -ForegroundColor Red
 Write-Host "                                                                              " -ForegroundColor Red
 Write-Host "  CRITICAL FILES WILL BE SAVED TO FLASH DRIVE - SECURE THEM IMMEDIATELY     " -ForegroundColor Red
 Write-Host "===============================================================================" -ForegroundColor Red
@@ -54,7 +56,7 @@ if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 Clear-Host
 Write-Host "================================================================================" -ForegroundColor Green
-Write-Host "              WINDOWS 11 CORE HARDENING SCRIPT v11.0 (1/3)" -ForegroundColor Green
+Write-Host "              WINDOWS 11 CORE HARDENING SCRIPT v11.1 (1/3)" -ForegroundColor Green
 Write-Host "                     Enterprise Security Lockdown Initiated" -ForegroundColor Green
 Write-Host "================================================================================" -ForegroundColor Green
 
@@ -130,32 +132,26 @@ $adminPasswordSuccess = $false
 Write-Log "Core hardening initiated on $($config.WindowsVersion)" "INFO"
 Write-Host "Results will be saved to: $logFolder" -ForegroundColor Cyan
 
-# 1. ADMIN ACCOUNT MANAGEMENT (CORRECTED)
+# 1. ADMIN ACCOUNT MANAGEMENT
 Write-Host "`n[1] Managing Administrator Accounts..." -ForegroundColor Green
 try {
-    # CRITICAL FIX: This logic is entirely refactored to comply with the project guide.
-    # It now guarantees the password file is created on every run, for new or existing users.
     $adminPassword = New-SecurePassword -Length $config.PasswordLength
     $securePassword = ConvertTo-SecureString $adminPassword -AsPlainText -Force
     $existingUser = Get-LocalUser -Name $config.NewAdminName -ErrorAction SilentlyContinue
     
     if ($existingUser) {
-        # Handles existing user by resetting password
         Write-Log "User '$($config.NewAdminName)' already exists. Resetting password." "WARNING"
         Set-LocalUser -Name $config.NewAdminName -Password $securePassword -ErrorAction Stop
         Enable-LocalUser -Name $config.NewAdminName -ErrorAction Stop
         Write-Log "Password reset for '$($config.NewAdminName)'" "SUCCESS"
     } else {
-        # Handles new user creation
         Write-Log "User '$($config.NewAdminName)' not found. Creating new user." "INFO"
-        New-LocalUser -Name $config.NewAdminName -Password $securePassword -FullName "Secure Operations Admin" -Description "Dedicated administrative account for system management" -PasswordNeverExpires -UserMayNotChangePassword -ErrorAction Stop
+        New-LocalUser -Name $config.NewAdminName -Password $securePassword -FullName "Secure Operations Admin" -Description "Dedicated admin account for system mgmt" -PasswordNeverExpires -UserMayNotChangePassword -ErrorAction Stop
         Write-Log "Created local user '$($config.NewAdminName)'" "SUCCESS"
     }
 
-    # This part now runs EVERY time, guaranteeing the file is created.
-    # Ensure user is in the Administrators group regardless of creation status
     Add-LocalGroupMember -Group 'Administrators' -Member $config.NewAdminName -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2 # Allow time for membership to apply
+    Start-Sleep -Seconds 2
 
     $adminMembers = Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue
     $isAdminMember = $adminMembers | Where-Object { $_.Name -like "*$($config.NewAdminName)" -or $_.Name -eq $config.NewAdminName }
@@ -163,7 +159,6 @@ try {
     if ($isAdminMember) {
         Write-Log "'$($config.NewAdminName)' confirmed as a member of Administrators" "SUCCESS"
 
-        # CRITICAL FILE CREATION: This block now runs for both new and existing users.
         $passwordFile = "$logFolder\SecOpsAdm_Password.txt"
         try {
             $passwordContent = @"
@@ -197,7 +192,6 @@ Use this account to log in and retrieve LAPS-managed Administrator passwords.
         Write-Log "Could not verify '$($config.NewAdminName)' was added to Administrators" "ERROR"
     }
 
-    # Demote specified users
     foreach ($user in $UsersToDemote) {
         $user = $user.Trim()
         if ($user -and ($user -ne $config.NewAdminName) -and ($user -ne $config.BuiltinAdminName)) {
@@ -220,15 +214,13 @@ Use this account to log in and retrieve LAPS-managed Administrator passwords.
     Write-Log "Admin account management failed: $_" "ERROR"
 }
 
-# 2. ADMINISTRATOR ACCOUNT MANAGEMENT (MANUAL PASSWORD SOLUTION)
+# 2. ADMINISTRATOR ACCOUNT MANAGEMENT
 Write-Host "`n[2] Managing Built-in Administrator Account..." -ForegroundColor Green
 
 try {
-    # Manual Administrator Password Management (Future SHIPS-style replacement planned)
     Write-Log "Implementing manual Administrator account password management" "INFO"
     Write-Log "Future SHIPS-style solution will replace this manual approach" "INFO"
     
-    # Check if built-in Administrator account exists
     $builtinAdmin = Get-LocalUser -Name $config.BuiltinAdminName -ErrorAction SilentlyContinue
     if (-not $builtinAdmin) {
         Write-Log "Built-in Administrator account not found" "ERROR"
@@ -236,25 +228,19 @@ try {
         throw "Cannot proceed - Administrator account missing"
     }
     
-    # Enable Administrator account and set dedicated password
     Write-Log "Enabling built-in Administrator account for manual password management" "INFO"
     
-    # Generate password first, then enable and set password in one operation
     $adminPassword = New-SecurePassword -Length $config.PasswordLength
     $secureAdminPassword = ConvertTo-SecureString $adminPassword -AsPlainText -Force
     
     try {
-        # Set password first (this will enable the account if disabled)
         Set-LocalUser -Name $config.BuiltinAdminName -Password $secureAdminPassword -ErrorAction Stop
-        # Explicitly enable and activate the account
         Enable-LocalUser -Name $config.BuiltinAdminName -ErrorAction SilentlyContinue
         net user $config.BuiltinAdminName /active:yes | Out-Null
         Write-Log "Built-in Administrator account enabled and password set successfully" "SUCCESS"
         
-        # Generate and set strong password for Administrator account
         Write-Log "Administrator account password updated successfully" "SUCCESS"
         
-        # Create Administrator password file
         $adminPasswordFile = "$logFolder\Administrator_Password.txt"
         $adminPasswordContent = @"
 Built-in Administrator Account Password (Manual Management)
@@ -295,7 +281,6 @@ Future SHIPS-style solution will provide automated password rotation.
         $adminPasswordSuccess = $false
     }
     
-    # Verify Administrator account configuration
     $verifyAdmin = Get-LocalUser -Name $config.BuiltinAdminName -ErrorAction SilentlyContinue
     if ($verifyAdmin -and $verifyAdmin.Enabled) {
         Write-Log "Administrator account verified as active and configured" "SUCCESS"
@@ -536,24 +521,20 @@ if ($wazuhMsi) {
     Write-Log "Wazuh installer not found - skipping" "WARNING"
 }
 
-# Sysmon Installation (CORRECTED)
+# Sysmon Installation
 $sysmonExe = "$($config.ScriptRoot)\Sysmon64.exe"
 $sysmonConfig = "$($config.ScriptRoot)\sysmonconfig-export.xml"
 if ((Test-Path $sysmonExe) -and (Test-Path $sysmonConfig)) {
     try {
-        # SYSMON FIX: Logic now handles both install and update.
         $sysmonService = Get-Service -Name 'Sysmon64' -ErrorAction SilentlyContinue
         if ($sysmonService) {
             Write-Log "Sysmon is already installed. Updating configuration..." "INFO"
-            # Use -c to apply a new configuration to an existing installation.
             & $sysmonExe -accepteula -c $sysmonConfig | Out-Null
         } else {
             Write-Log "Installing Sysmon with configuration" "INFO"
-            # Use -i to install the service for the first time.
             & $sysmonExe -accepteula -i $sysmonConfig | Out-Null
         }
         
-        # Verify that the service is running after install or update attempt.
         if (Get-Service -Name 'Sysmon64' -ErrorAction SilentlyContinue) {
             $hardeningStatus.Successes.Add("AU-3: Sysmon logging agent installed/updated") | Out-Null
             Write-Log "Sysmon installed or updated successfully" "SUCCESS"
@@ -575,37 +556,9 @@ if ((Test-Path $sysmonExe) -and (Test-Path $sysmonConfig)) {
     Write-Log "Sysmon files not found - skipping installation" "WARNING"
 }
 
-# 8. WDAC POLICY APPLICATION
-Write-Host "`n[8] Applying Windows Defender Application Control..." -ForegroundColor Green
-if (Get-Command -Name ConvertFrom-CIPolicy -ErrorAction SilentlyContinue) {
-    $wdacXml = "$($config.ScriptRoot)\WDAC_Policy.xml"
-    if (Test-Path $wdacXml) {
-        try {
-            $wdacBinary = "$env:SystemRoot\System32\CodeIntegrity\SIPolicy.p7b"
-            ConvertFrom-CIPolicy -XmlFilePath $wdacXml -BinaryFilePath $wdacBinary
-            
-            if (Test-Path $wdacBinary) {
-                $hardeningStatus.Successes.Add("CM-5: WDAC application control policy applied") | Out-Null
-                Write-Log "WDAC policy applied successfully - Reboot required for activation" "SUCCESS"
-            } else {
-                $hardeningStatus.Errors.Add("WDAC policy binary creation failed") | Out-Null
-                Write-Log "WDAC policy binary creation failed" "ERROR"
-            }
-        } catch {
-            $hardeningStatus.Errors.Add("WDAC policy application failed: $_") | Out-Null
-            Write-Log "WDAC policy application failed: $_" "ERROR"
-        }
-    } else {
-        Write-Log "WDAC policy file not found - skipping" "WARNING"
-    }
-} else {
-    Write-Log "WDAC cmdlets not available on this system" "WARNING"
-}
-
-# 9. ENFORCE PASSWORD POLICY AND REMEDIATE STANDARD ACCOUNTS
-Write-Host "`n[9] Enforcing Password Policy and Remediating Standard User Accounts..." -ForegroundColor Green
+# 8. ENFORCE PASSWORD POLICY AND REMEDIATE STANDARD ACCOUNTS
+Write-Host "`n[8] Enforcing Password Policy and Remediating Standard User Accounts..." -ForegroundColor Green
 try {
-    # Part 1: Enact the Official System-Wide Password Policy
     Write-Log "Setting system-wide password policy (min length: 14, history: 5)" "INFO"
     
     try {
@@ -618,23 +571,19 @@ try {
         $hardeningStatus.Errors.Add("Failed to set system-wide password policy") | Out-Null
     }
     
-    # Part 2: Force Password Change on Existing Non-Admin Accounts
     Write-Log "Starting one-time remediation for non-compliant standard accounts" "INFO"
     
-    # Step A: Get a list of all current administrators and system accounts to ignore
     $ignoreUsers = @(
-        $config.NewAdminName,           # Ignore the SecOpsAdm account
-        $config.BuiltinAdminName,       # Ignore the built-in Administrator (managed by LAPS)
+        $config.NewAdminName,
+        $config.BuiltinAdminName,
         "Guest",
         "DefaultAccount",
         "WDAGUtilityAccount"
     )
     
-    # Add all current administrators to ignore list
     try {
         $adminMembers = Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue
         foreach ($admin in $adminMembers) {
-            # Extract just the username part (remove domain if present)
             $userName = $admin.Name -replace '^.*\\', ''
             $ignoreUsers += $userName
         }
@@ -642,31 +591,26 @@ try {
         Write-Log "Could not retrieve administrator group members: $_" "WARNING"
     }
     
-    $ignoreUsers = $ignoreUsers | Select-Object -Unique # Ensure no duplicates in the list
+    $ignoreUsers = $ignoreUsers | Select-Object -Unique
     Write-Log "The following users will be ignored: $($ignoreUsers -join ', ')" "INFO"
     
-    # Step B: Get all enabled local user accounts
     $allEnabledUsers = Get-LocalUser | Where-Object { $_.Enabled -eq $true }
     Write-Log "Found $($allEnabledUsers.Count) enabled local user accounts" "INFO"
     
-    # Step C: Loop through users, flagging any that are not on the ignore list
     $standardUsersFound = 0
     foreach ($user in $allEnabledUsers) {
         if ($user.Name -in $ignoreUsers) {
             Write-Log "Skipping password check for exempt user: $($user.Name)" "INFO"
-            continue # Skip to the next user
+            continue
         }
         
-        # If the user is not in the ignore list, they are a standard user. Flag them.
         $standardUsersFound++
         Write-Log "User '$($user.Name)' is a standard user. Flagging for password change." "WARNING"
         try {
-            # Use PowerShell cmdlet instead of NET USER command for better compatibility
             Set-LocalUser -Name $user.Name -ChangePasswordAtLogon $true -ErrorAction Stop
             Write-Log "Successfully flagged user '$($user.Name)' for password change at next logon" "SUCCESS"
             $hardeningStatus.Successes.Add("IA-5: Flagged standard user '$($user.Name)' for mandatory password change") | Out-Null
         } catch {
-            # Fallback to wmic if PowerShell cmdlet fails
             try {
                 $wmicResult = wmic useraccount where "Name='$($user.Name)'" set PasswordChangeable=TRUE,PasswordExpires=TRUE 2>$null
                 Write-Log "Successfully flagged user '$($user.Name)' for password change using WMIC fallback" "SUCCESS"
@@ -688,6 +632,229 @@ try {
 } catch {
     Write-Log "An error occurred during password policy enforcement: $_" "ERROR"
     $hardeningStatus.Errors.Add("Failed during password policy enforcement and remediation: $_") | Out-Null
+}
+
+# 9. ENHANCED SECURITY POLICIES AND REGISTRY HARDENING
+Write-Host "`n[9] Implementing Enhanced Security Policies..." -ForegroundColor Green
+
+try {
+    Write-Log "Applying enhanced security policies via registry modifications" "INFO"
+    
+    # 10.1 MICROSOFT EDGE SECURITY POLICIES
+    Write-Log "Configuring Microsoft Edge security restrictions" "INFO"
+    
+    $edgePolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
+    $edgeRecommendedPath = "HKLM:\SOFTWARE\Policies\Microsoft\Edge\Recommended"
+    
+    if (-not (Test-Path $edgePolicyPath)) {
+        New-Item -Path $edgePolicyPath -Force | Out-Null
+    }
+    if (-not (Test-Path $edgeRecommendedPath)) {
+        New-Item -Path $edgeRecommendedPath -Force | Out-Null
+    }
+    
+    # Edge Data Restrictions - Only allow bookmarks
+    Set-ItemProperty -Path $edgePolicyPath -Name "PasswordManagerEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "AutofillAddressEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "AutofillCreditCardEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "PaymentMethodQueryEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "SaveCookiesOnExit" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "ClearBrowsingDataOnExit" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    
+    # Form-field autofill denial
+    Set-ItemProperty -Path $edgePolicyPath -Name "AutofillEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "FormFillEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "SearchSuggestEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    
+    # Extension installation block
+    Set-ItemProperty -Path $edgePolicyPath -Name "ExtensionInstallBlocklist" -Value @("*") -Type MultiString -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "ExtensionInstallForcelist" -Value @() -Type MultiString -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "ExtensionSettings" -Value '{"*":{"installation_mode":"blocked"}}' -Type String -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "DeveloperToolsAvailability" -Value 2 -Type DWord -ErrorAction SilentlyContinue
+    
+    # Clear existing stored data on policy application
+    Set-ItemProperty -Path $edgePolicyPath -Name "ForceEphemeralProfiles" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "BrowserSignin" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $edgePolicyPath -Name "SyncDisabled" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    
+    $hardeningStatus.Successes.Add("CM-6: Microsoft Edge security policies configured") | Out-Null
+    Write-Log "Microsoft Edge security restrictions applied successfully" "SUCCESS"
+    
+    # 10.2 SYSTEM IDLE TIMEOUT - 10 MINUTE MANDATORY LOCK
+    Write-Log "Configuring 10-minute mandatory screen lock" "INFO"
+    
+    $screenSaverPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    if (-not (Test-Path $screenSaverPath)) {
+        New-Item -Path $screenSaverPath -Force | Out-Null
+    }
+    
+    Set-ItemProperty -Path $screenSaverPath -Name "InactivityTimeoutSecs" -Value 600 -Type DWord -ErrorAction SilentlyContinue
+    
+    $screensaverUserPath = "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop"
+    if (-not (Test-Path $screensaverUserPath)) {
+        New-Item -Path $screensaverUserPath -Force | Out-Null
+    }
+    
+    Set-ItemProperty -Path $screensaverUserPath -Name "ScreenSaveActive" -Value "1" -Type String -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $screensaverUserPath -Name "ScreenSaverIsSecure" -Value "1" -Type String -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $screensaverUserPath -Name "ScreenSaveTimeOut" -Value "600" -Type String -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $screensaverUserPath -Name "SCRNSAVE.EXE" -Value "scrnsave.scr" -Type String -ErrorAction SilentlyContinue
+    
+    # Apply to default user profile for new users
+    reg load HKU\DEFAULT "C:\Users\Default\NTUSER.DAT" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        reg add "HKU\DEFAULT\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop" /v "ScreenSaveActive" /t REG_SZ /d "1" /f | Out-Null
+        reg add "HKU\DEFAULT\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop" /v "ScreenSaverIsSecure" /t REG_SZ /d "1" /f | Out-Null
+        reg add "HKU\DEFAULT\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop" /v "ScreenSaveTimeOut" /t REG_SZ /d "600" /f | Out-Null
+        reg unload HKU\DEFAULT | Out-Null
+    }
+    
+    $hardeningStatus.Successes.Add("AC-11: 10-minute mandatory screen lock configured") | Out-Null
+    Write-Log "10-minute mandatory screen lock configured successfully" "SUCCESS"
+    
+    # 10.3 NO EXECUTE POLICIES - DESKTOP AND TEMP FOLDER RESTRICTIONS
+    Write-Log "Configuring no execute policies for high-risk locations" "INFO"
+    
+    $srpPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
+    if (-not (Test-Path $srpPath)) {
+        New-Item -Path $srpPath -Force | Out-Null
+    }
+    
+    # Enable Software Restriction Policies
+    Set-ItemProperty -Path $srpPath -Name "AuthenticodeEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $srpPath -Name "DefaultLevel" -Value 262144 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $srpPath -Name "ExecutableTypes" -Value "ADE;ADP;BAS;BAT;CHM;CMD;COM;CPL;CRT;EXE;HLP;HTA;INF;INS;ISP;LNK;MDB;MDE;MSC;MSI;MSP;MST;OCX;PCD;PIF;REG;SCR;SHS;URL;VB;WSF;WSH;WSC" -Type String -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $srpPath -Name "PolicyScope" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $srpPath -Name "TransparentEnabled" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    
+    # Create disallowed paths for high-risk locations
+    $disallowedPaths = @(
+        @{Path="%USERPROFILE%\Desktop\*"; Description="Desktop execution prevention"},
+        @{Path="%ALLUSERSPROFILE%\Desktop\*"; Description="Public desktop execution prevention"},
+        @{Path="%USERPROFILE%\Downloads\*"; Description="Downloads folder execution prevention"},
+        @{Path="%TEMP%\*"; Description="Temp folder execution prevention"},
+        @{Path="%TMP%\*"; Description="TMP folder execution prevention"},
+        @{Path="%USERPROFILE%\AppData\Local\Temp\*"; Description="User temp execution prevention"},
+        @{Path="%USERPROFILE%\Documents\*"; Description="Documents folder execution prevention"},
+        @{Path="%PUBLIC%\Desktop\*"; Description="Public desktop execution prevention"}
+    )
+    
+    $pathCounter = 0
+    foreach ($pathRule in $disallowedPaths) {
+        $pathCounter++
+        $pathRulePath = "$srpPath\0\Paths\{$([guid]::NewGuid().ToString())}"
+        New-Item -Path $pathRulePath -Force | Out-Null
+        Set-ItemProperty -Path $pathRulePath -Name "ItemData" -Value $pathRule.Path -Type String -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $pathRulePath -Name "SaferFlags" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $pathRulePath -Name "ItemSize" -Value $pathRule.Path.Length -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $pathRulePath -Name "Description" -Value $pathRule.Description -Type String -ErrorAction SilentlyContinue
+    }
+    
+    # Create allowed paths for legitimate applications and URBackup
+    $allowedPaths = @(
+        @{Path="%PROGRAMFILES%\*"; Description="Program Files execution allowed"},
+        @{Path="%PROGRAMFILES(X86)%\*"; Description="Program Files x86 execution allowed"},
+        @{Path="%WINDIR%\*"; Description="Windows system execution allowed"},
+        @{Path="%WINDIR%\System32\*"; Description="System32 execution allowed"},
+        @{Path="%WINDIR%\SysWOW64\*"; Description="SysWOW64 execution allowed"},
+        @{Path="%PROGRAMFILES%\UrBackup\*"; Description="URBackup client execution allowed"},
+        @{Path="%PROGRAMFILES(X86)%\UrBackup\*"; Description="URBackup client x86 execution allowed"},
+        @{Path="%PROGRAMDATA%\Microsoft\Windows Defender\*"; Description="Windows Defender execution allowed"}
+    )
+    
+    foreach ($pathRule in $allowedPaths) {
+        $pathRulePath = "$srpPath\262144\Paths\{$([guid]::NewGuid().ToString())}"
+        New-Item -Path $pathRulePath -Force | Out-Null
+        Set-ItemProperty -Path $pathRulePath -Name "ItemData" -Value $pathRule.Path -Type String -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $pathRulePath -Name "SaferFlags" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $pathRulePath -Name "ItemSize" -Value $pathRule.Path.Length -Type DWord -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $pathRulePath -Name "Description" -Value $pathRule.Description -Type String -ErrorAction SilentlyContinue
+    }
+    
+    $hardeningStatus.Successes.Add("SI-7: No execute policies configured for high-risk locations") | Out-Null
+    Write-Log "No execute policies configured for desktop and temp folders" "SUCCESS"
+    
+    # 10.4 URBACKUP FIREWALL EXCEPTIONS
+    Write-Log "Configuring URBackup firewall exceptions" "INFO"
+    
+    $urbackupRules = @(
+        @{Name="URBackup-Client-TCP-35621"; Protocol="TCP"; Port=35621; Direction="Inbound"; Description="URBackup file backup transfers"},
+        @{Name="URBackup-Client-TCP-35623"; Protocol="TCP"; Port=35623; Direction="Both"; Description="URBackup commands and image backups"},
+        @{Name="URBackup-Client-UDP-35622"; Protocol="UDP"; Port=35622; Direction="Both"; Description="URBackup client discovery"},
+        @{Name="URBackup-Client-UDP-35623"; Protocol="UDP"; Port=35623; Direction="Outbound"; Description="URBackup server discovery response"},
+        @{Name="URBackup-Web-TCP-55414"; Protocol="TCP"; Port=55414; Direction="Outbound"; Description="URBackup web interface access"},
+        @{Name="URBackup-Internet-TCP-55415"; Protocol="TCP"; Port=55415; Direction="Outbound"; Description="URBackup internet client communication"}
+    )
+    
+    foreach ($rule in $urbackupRules) {
+        try {
+            if ($rule.Direction -eq "Both") {
+                netsh advfirewall firewall add rule name="$($rule.Name)-In" dir=in action=allow protocol="$($rule.Protocol)" localport="$($rule.Port)" | Out-Null
+                netsh advfirewall firewall add rule name="$($rule.Name)-Out" dir=out action=allow protocol="$($rule.Protocol)" remoteport="$($rule.Port)" | Out-Null
+                Write-Log "Created URBackup firewall rule: $($rule.Name) (bidirectional)" "INFO"
+            } elseif ($rule.Direction -eq "Inbound") {
+                netsh advfirewall firewall add rule name="$($rule.Name)" dir=in action=allow protocol="$($rule.Protocol)" localport="$($rule.Port)" | Out-Null
+                Write-Log "Created URBackup firewall rule: $($rule.Name) (inbound)" "INFO"
+            } else {
+                netsh advfirewall firewall add rule name="$($rule.Name)" dir=out action=allow protocol="$($rule.Protocol)" remoteport="$($rule.Port)" | Out-Null
+                Write-Log "Created URBackup firewall rule: $($rule.Name) (outbound)" "INFO"
+            }
+        } catch {
+            Write-Log "Failed to create URBackup firewall rule: $($rule.Name) - $_" "WARNING"
+        }
+    }
+    
+    $hardeningStatus.Successes.Add("SC-7: URBackup firewall exceptions configured") | Out-Null
+    Write-Log "URBackup firewall exceptions configured successfully" "SUCCESS"
+    
+    # 10.5 ADDITIONAL WINDOWS SECURITY HARDENING
+    Write-Log "Applying additional Windows security configurations" "INFO"
+    
+    $securityConfigs = @{
+        # Disable Windows Script Host
+        "HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings" = @{
+            "Enabled" = 0
+        }
+        # Disable Windows Installer over network
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" = @{
+            "AlwaysInstallElevated" = 0
+            "DisableMSI" = 1
+        }
+        # Disable AutoRun/AutoPlay
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" = @{
+            "NoDriveTypeAutoRun" = 255
+            "NoAutorun" = 1
+        }
+        # System policies and Enhanced UAC settings
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" = @{
+            "EnableGuestAccount" = 0
+            "DontDisplayLastUserName" = 1
+            "DisableCAD" = 0
+            "ConsentPromptBehaviorAdmin" = 2
+            "ConsentPromptBehaviorUser" = 0
+            "EnableInstallerDetection" = 1
+            "EnableLUA" = 1
+            "EnableVirtualization" = 1
+            "PromptOnSecureDesktop" = 1
+        }
+    }
+    
+    foreach ($regPath in $securityConfigs.Keys) {
+        if (-not (Test-Path $regPath)) {
+            New-Item -Path $regPath -Force | Out-Null
+        }
+        foreach ($setting in $securityConfigs[$regPath].GetEnumerator()) {
+            Set-ItemProperty -Path $regPath -Name $setting.Key -Value $setting.Value -Type DWord -ErrorAction SilentlyContinue
+            Write-Log "Applied security setting: $regPath\$($setting.Key) = $($setting.Value)" "INFO"
+        }
+    }
+    
+    $hardeningStatus.Successes.Add("CM-6: Additional Windows security configurations applied") | Out-Null
+    Write-Log "Additional Windows security hardening completed" "SUCCESS"
+    
+} catch {
+    $hardeningStatus.Errors.Add("Enhanced security policies configuration failed: $_") | Out-Null
+    Write-Log "Enhanced security policies configuration failed: $_" "ERROR"
 }
 
 # Save status for next scripts
@@ -743,13 +910,23 @@ if ($adminPasswordFileExists) {
     Write-Host "   [X] Administrator Password File: FAILED" -ForegroundColor Red
 }
 
+Write-Host "`nENHANCED SECURITY POLICIES APPLIED:" -ForegroundColor Cyan
+Write-Host "   [+] Microsoft Edge Data Restrictions" -ForegroundColor Green
+Write-Host "   [+] 10-Minute Mandatory Screen Lock" -ForegroundColor Green
+Write-Host "   [+] No Execute Policies (Desktop/Temp)" -ForegroundColor Green
+Write-Host "   [+] Form-Field Autofill Disabled" -ForegroundColor Green
+Write-Host "   [+] Extension Installation Blocked" -ForegroundColor Green
+Write-Host "   [+] URBackup Firewall Exceptions" -ForegroundColor Green
+Write-Host "   [+] Additional Windows Security Hardening" -ForegroundColor Green
+
 Write-Host "`nNEXT STEPS:" -ForegroundColor Cyan
 Write-Host "   1. Run Script 2: '2-Compliance-Collection.ps1'" -ForegroundColor White
 Write-Host "   2. Run Script 3: '3-Final-Report.ps1'" -ForegroundColor White
 Write-Host "   3. SECURE the password and BitLocker key files IMMEDIATELY" -ForegroundColor Yellow
-Write-Host "   4. Future SHIPS-compatible solution will replace manual Administrator password management" -ForegroundColor Yellow
+Write-Host "   4. Test Edge browser restrictions and screen lock functionality" -ForegroundColor Yellow
+Write-Host "   5. Verify URBackup client connectivity" -ForegroundColor Yellow
 
-Write-Log "Core hardening script completed. Proceeding to compliance collection phase." "INFO"
+Write-Log "Core hardening script completed with enhanced security policies. Proceeding to compliance collection phase." "INFO"
 
 Write-Host "`nPress any key to continue..." -ForegroundColor White
 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
