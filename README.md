@@ -199,14 +199,47 @@ The console adds a new top-level "PostHardening" object inside the existing hard
 
 Every console action either creates or updates entries here. The companion Undo-PostHardening.ps1 reads this object to reverse the actions.
 
-### **Optional configuration files (next to the console on the USB)**
+### **Installer files on the USB**
+
+Place these next to `Post-Hardening-Console.ps1` on the USB drive. The console auto-discovers them by filename glob.
+
+| Tool | What to download | Source | Notes |
+|:--|:--|:--|:--|
+| **RustDesk** | `rustdesk-X.Y.Z-x86_64.exe` | [github.com/rustdesk/rustdesk/releases](https://github.com/rustdesk/rustdesk/releases) | RustDesk does not ship an MSI for Windows. The `.exe` is the only option; its `--silent-install` flag is source-verified in `core_main.rs`. |
+| **Tailscale** | `tailscale-setup-X.Y.Z-amd64.msi` (or `-arm64.msi` for ARM64 hardware) | [pkgs.tailscale.com/stable](https://pkgs.tailscale.com/stable/) | **Use the MSI, not the .exe.** Tailscale's `.exe` is a closed-source WiX bootstrapper with no documented silent flag. The console will fall back to the `.exe` if no MSI is found, but logs a warning and may fail if the bootstrapper pops its GUI. |
+
+### **Optional configuration files (also next to the console)**
 
 | File | Purpose |
 |:--|:--|
-| rustdesk-\*.msi or rustdesk-\*.exe | RustDesk installer (auto-discovered). |
-| rustdesk-server.txt | Pre-fills the self-hosted server field (one line, e.g. `rdsk.example.com:21116`). |
-| rustdesk-key.txt | Pre-fills the self-hosted key field. |
-| tailscale-setup-\*.exe or tailscale-\*.msi | Tailscale installer (auto-discovered). |
+| `rustdesk-server.txt` | Pre-fills the self-hosted RustDesk server field. One line, e.g. `rdsk.example.com:21116`. |
+| `rustdesk-key.txt` | Pre-fills the self-hosted RustDesk public key field. |
+
+If neither RustDesk nor Tailscale will be used on this machine, the installer files can be omitted; the corresponding Install buttons will report "installer not found on USB" and do nothing.
+
+### **Final USB layout**
+
+```
+E:\
+  Unified_PowerShell_Hardening_Script.ps1
+  undo-hardening.ps1
+  collect-compliance-data.ps1
+  DefenderExclusion-GUI.ps1
+  Post-Hardening-Console.ps1
+  Undo-PostHardening.ps1
+  README.md
+
+  rustdesk-1.x.y-x86_64.exe              <- RustDesk (only ships .exe)
+  tailscale-setup-1.x.y-amd64.msi        <- Tailscale (prefer .msi)
+  rustdesk-server.txt                    <- optional, self-hosted RustDesk
+  rustdesk-key.txt                       <- optional, self-hosted RustDesk
+
+  wazuh-agent-X.Y.Z.msi                  <- optional, picked up by hardening
+  Sysmon64.exe                           <- optional, picked up by hardening
+  sysmon.xml                             <- optional, picked up by hardening
+  LAPS.x64.msi                           <- optional, picked up by hardening
+  WDAC_Policy.xml                        <- optional, picked up by hardening
+```
 
 ### **Usage**
 
