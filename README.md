@@ -13,8 +13,10 @@ This document is the complete guide for the PowerShell Hardening Toolkit, a coll
 7. [Part 2: The Rollback Script (Undo-Hardening.ps1)](#bookmark=id.k9ftjjc8hl4x)  
 8. [Part 3: The Exclusion Management GUI (Add-DefenderExclusion-GUI.ps1)](#bookmark=id.7f3ds9bc9ln)  
 9. [Part 4: The Standalone Audit Script (Collect-ComplianceData.ps1)](#bookmark=id.n227cqiymgqb)  
-10. [Troubleshooting](#bookmark=id.9t922whwhe5f)  
-11. [Disclaimer](#bookmark=id.immmob1kpsz4)
+10. [Part 5: The Post-Hardening Console GUI (Post-Hardening-Console.ps1)](#part-5-the-post-hardening-console-gui-post-hardening-consoleps1)  
+11. [Part 6: The Post-Hardening Rollback Script (Undo-PostHardening.ps1)](#part-6-the-post-hardening-rollback-script-undo-posthardeningps1)  
+12. [Troubleshooting](#bookmark=id.9t922whwhe5f)  
+13. [Disclaimer](#bookmark=id.immmob1kpsz4)
 
 ## **CRITICAL SECURITY WARNING**
 
@@ -34,6 +36,8 @@ Your toolkit should contain the following files:
 * Undo-Hardening.ps1: An interactive script to revert changes made by the hardening script.  
 * Add-DefenderExclusion-GUI.ps1: A graphical tool for managing Defender ASR/CFA exceptions.  
 * Collect-ComplianceData.ps1: A standalone, read-only script for periodic compliance auditing.  
+* Post-Hardening-Console.ps1: A WinForms GUI that launches the hardening pipeline and provides post-hardening one-click toggles (RustDesk, Tailscale, RDP, Defender exclusions, custom firewall rules).  
+* Undo-PostHardening.ps1: Reverses every change made via the Post-Hardening Console. Run before Undo-Hardening.ps1 if a full rollback is needed.  
 * README.md: This documentation file.
 
 ## **Framework Compliance Support**
@@ -96,11 +100,35 @@ This script applies the security configurations and collects the initial complia
    * **To Demote Specific Admins:**  
      .\\Unified-Hardening.ps1 \-UsersToDemote "OldAdmin", "TempUser"
 
+   * **To pre-stage LAPS on a non-domain-joined machine** (LAPS cannot *function* without AD, but you may want the policy pre-configured for a future domain join):  
+     .\\Unified-Hardening.ps1 \-ForceLAPS
+
 5. **Completion:** Once finished, the script will have created a folder named PC-\<ComputerName\>-LOGS on your drive. Eject and securely store the USB drive immediately.
+
+### **LAPS and domain join**
+
+LAPS (Local Administrator Password Solution) cannot rotate passwords on machines that are not joined to Active Directory. As of v9.2 the hardening script auto-detects domain membership via `(Get-CimInstance Win32_ComputerSystem).PartOfDomain`:
+
+| Scenario | Default behavior |
+|:--|:--|
+| Domain-joined (modern LAPS cmdlet present) | Configure modern LAPS, enable built-in Administrator. |
+| Domain-joined (legacy LAPS MSI on USB) | Install + configure legacy LAPS, enable built-in Administrator. |
+| **Not** domain-joined, `-ForceLAPS` not specified | **Skip LAPS**, disable the built-in Administrator account as a compensating control. |
+| Not domain-joined, `-ForceLAPS` specified | Configure LAPS anyway (will only become functional after the machine joins a domain). |
 
 ## **Part 2: The Rollback Script (Undo-Hardening.ps1)**
 
-Use this script to safely revert the system to its pre-hardened state.
+Use this script to safely revert the **non-account** portions of the hardened baseline.
+
+### **Account changes are intentionally NOT reversed**
+
+As of v9.2, this script does **not** reverse:
+
+* Creation of the `SecOpsAdm` administrator account.
+* Demotion of users named via `-UsersToDemote`.
+* Enable/disable state of the built-in `Administrator`.
+
+Once a machine has been hardened those accounts form the live security posture. Reversing them would lock out the operator (who is now signed in as `SecOpsAdm`) and silently re-grant privileges that were intentionally removed. Manage account state directly if needed.
 
 ### **Usage**
 
@@ -109,7 +137,7 @@ Use this script to safely revert the system to its pre-hardened state.
 3. **Execute:** Run the script, pointing it to the correct log folder for the machine you are on.  
    .\\Undo-Hardening.ps1 \-LogFolderPath "E:\\PC-WORKSTATION-01-LOGS"
 
-4. **Follow the Menu:** The interactive menu will prompt you to undo specific changes, such as 'Admin Account Changes', 'Defender Hardening', 'BitLocker Encryption', and 'Remote Access Disabling'. You can also choose the 'UNDO ALL' option to revert all applied settings in sequence. Be aware of high-risk actions that may require a reboot.
+4. **Follow the Menu:** The interactive menu will prompt you to undo specific non-account changes: LAPS policy, Defender hardening, BitLocker encryption, agent installs, WDAC policy, firewall hardening, and remote-access disabling. You can also choose 'UNDO ALL' to revert every non-account setting in sequence. Be aware of high-risk actions that may require a reboot.
 
 ## **Part 3: The Exclusion Management GUI (Add-DefenderExclusion-GUI.ps1)**
 
@@ -138,6 +166,108 @@ Use this script to perform periodic compliance checks *after* the initial harden
    .\\Collect-ComplianceData.ps1
 
 3. **Completion:** A new timestamped audit folder will be created inside the PC-\<ComputerName\>-AUDITS directory on your drive.
+
+## **Part 5: The Post-Hardening Console GUI (Post-Hardening-Console.ps1)**
+
+A WinForms console that wraps the entire pipeline (run hardening, run audit, run undo) and provides post-hardening one-click toggles. Built with the Windows-shipped System.Windows.Forms and System.Drawing assemblies only - no third-party dependencies.
+
+### **Tabs**
+
+1. **Hardening** - Buttons to run the unified hardening script, the periodic audit script, the post-hardening rollback (Undo-PostHardening.ps1), and the base hardening rollback (undo-hardening.ps1). All four launch as elevated child processes.
+2. **Remote Access** - One-click install / uninstall for **RustDesk** (with a Public-relays-vs-Self-hosted radio; self-hosted reads server/key from rustdesk-server.txt and rustdesk-key.txt next to the console if present) and **Tailscale** (install, then a separate Login button that opens a console where 'tailscale up' prints the browser auth URL). Includes Re-enable RDP / Disable RDP buttons.
+3. **Defender Exclusions** - Browse File / Browse Folder + Add / Remove against Defender ASR and Controlled Folder Access. Subsumes the standalone Add-DefenderExclusion-GUI.ps1.
+4. **Firewall** - Add custom outbound allow rules (TCP/UDP) and remove them. Useful for apps that need network reach after the default-deny outbound lockdown.
+5. **System State** - Read-only viewer for the latest hardening-state.json.
+6. **About** - Version info, log folder path, button to open the log folder in Explorer.
+
+### **State Contract**
+
+The console adds a new top-level "PostHardening" object inside the existing hardening-state.json:
+
+```json
+{
+  "PostHardening": {
+    "Version": 1,
+    "RustDesk":  { "Installed": true,  "Mode": "SelfHosted", "Server": "rdsk.example.com:21116", "InstallerPath": "...", "FirewallRules": ["RustDesk-Out-TCP","RustDesk-Out-UDP"], "DefenderExclusions": ["C:\\Program Files\\RustDesk"], "Timestamp": "..." },
+    "Tailscale": { "Installed": true,  "InstallerPath": "...", "FirewallRules": ["Tailscale-Direct-UDP"], "DefenderExclusions": ["C:\\Program Files\\Tailscale"], "Timestamp": "..." },
+    "RdpReenabled": false,
+    "CustomFirewallRules":     [ { "Name": "MyApp-Out", "Protocol": "TCP", "Port": "8080", "Timestamp": "..." } ],
+    "DefenderExclusionsAdded": [ { "Path": "C:\\Apps\\X.exe", "ASR": true, "CFA": true, "Timestamp": "..." } ]
+  }
+}
+```
+
+Every console action either creates or updates entries here. The companion Undo-PostHardening.ps1 reads this object to reverse the actions.
+
+### **Installer files on the USB**
+
+Place these next to `Post-Hardening-Console.ps1` on the USB drive. The console auto-discovers them by filename glob.
+
+| Tool | What to download | Source | Notes |
+|:--|:--|:--|:--|
+| **RustDesk** | `rustdesk-X.Y.Z-x86_64.exe` | [github.com/rustdesk/rustdesk/releases](https://github.com/rustdesk/rustdesk/releases) | RustDesk does not ship an MSI for Windows. The `.exe` is the only option; its `--silent-install` flag is source-verified in `core_main.rs`. |
+| **Tailscale** | `tailscale-setup-X.Y.Z-amd64.msi` (or `-arm64.msi` for ARM64 hardware) | [pkgs.tailscale.com/stable](https://pkgs.tailscale.com/stable/) | **Use the MSI, not the .exe.** Tailscale's `.exe` is a closed-source WiX bootstrapper with no documented silent flag. The console will fall back to the `.exe` if no MSI is found, but logs a warning and may fail if the bootstrapper pops its GUI. |
+
+### **Optional configuration files (also next to the console)**
+
+| File | Purpose |
+|:--|:--|
+| `rustdesk-server.txt` | Pre-fills the self-hosted RustDesk server field. One line, e.g. `rdsk.example.com:21116`. |
+| `rustdesk-key.txt` | Pre-fills the self-hosted RustDesk public key field. |
+
+If neither RustDesk nor Tailscale will be used on this machine, the installer files can be omitted; the corresponding Install buttons will report "installer not found on USB" and do nothing.
+
+### **Final USB layout**
+
+```
+E:\
+  Unified_PowerShell_Hardening_Script.ps1
+  undo-hardening.ps1
+  collect-compliance-data.ps1
+  DefenderExclusion-GUI.ps1
+  Post-Hardening-Console.ps1
+  Undo-PostHardening.ps1
+  README.md
+
+  rustdesk-1.x.y-x86_64.exe              <- RustDesk (only ships .exe)
+  tailscale-setup-1.x.y-amd64.msi        <- Tailscale (prefer .msi)
+  rustdesk-server.txt                    <- optional, self-hosted RustDesk
+  rustdesk-key.txt                       <- optional, self-hosted RustDesk
+
+  wazuh-agent-X.Y.Z.msi                  <- optional, picked up by hardening
+  Sysmon64.exe                           <- optional, picked up by hardening
+  sysmon.xml                             <- optional, picked up by hardening
+  LAPS.x64.msi                           <- optional, picked up by hardening
+  WDAC_Policy.xml                        <- optional, picked up by hardening
+```
+
+### **Usage**
+
+1. **Prerequisites:** Run the unified hardening script at least once on this machine - the console operates on the latest PC-\<ComputerName\>-LOGS\HARDENING-\<timestamp\> folder it finds on the same drive.
+2. **Launch:** In File Explorer on the USB drive, right-click Post-Hardening-Console.ps1 and select **"Run with PowerShell"**. Approve the UAC prompt.
+3. **Work:** Use the tabs in sequence as needed - typically Hardening first (to confirm or run the lockdown), then Remote Access / Defender / Firewall to apply post-hardening exceptions.
+4. **Log:** Every action is appended to `post-hardening-log.txt` inside the hardening folder for that run.
+
+## **Part 6: The Post-Hardening Rollback Script (Undo-PostHardening.ps1)**
+
+Reverses every change made via the Post-Hardening Console. Run this **before** Undo-Hardening.ps1 if you want a full rollback to factory state.
+
+### **Usage**
+
+1. **Launch:** Open PowerShell **as an Administrator**, navigate to the USB drive.
+2. **Interactive menu:**
+
+   ```
+   .\Undo-PostHardening.ps1 -LogFolderPath "E:\PC-WORKSTATION-01-LOGS\HARDENING-2026-05-14_09-22-31"
+   ```
+
+3. **Non-interactive (everything at once):**
+
+   ```
+   .\Undo-PostHardening.ps1 -LogFolderPath "E:\PC-WORKSTATION-01-LOGS\HARDENING-2026-05-14_09-22-31" -All
+   ```
+
+The script also runs from the GUI's "Undo Post-Hardening" button on the Hardening tab.
 
 ## **Troubleshooting**
 

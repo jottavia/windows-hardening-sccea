@@ -3,8 +3,14 @@
     Reverts changes made by the Unified-Hardening.ps1 script (v9+).
 .DESCRIPTION
     This script reads a 'hardening-state.json' file from a specified log folder
-    and provides a menu to undo the security changes, including the new LAPS logic. 
-    It must be run with administrative privileges from the same removable drive as the original script.
+    and provides a menu to undo the non-account security changes.
+
+    Account-related operations performed during hardening (creation of SecOpsAdm,
+    demotion of named users, and enable/disable of the built-in Administrator)
+    are intentionally NOT reversed by this script. Once a machine has been
+    hardened, those account changes form the new security baseline; reversing
+    them would destroy the operator's current access and re-grant privileges
+    that were intentionally removed.
 
     *** WARNING ***
     This script will reduce the security posture of the system. Operations like
@@ -31,25 +37,15 @@ if (-not (Test-Path $stateFile)) {
 $state = Get-Content -Path $stateFile | ConvertFrom-Json
 
 # --- UNDO FUNCTIONS ---
+#
+# NOTE: account-related changes (SecOpsAdm creation, demotion of named users,
+# built-in Administrator enable/disable) are deliberately NOT reversed here.
+# Once the hardened baseline is in place those accounts form the live security
+# posture; reverting them would lock out the operator and re-grant privileges
+# that were intentionally removed.
 
-function Undo-AdminChanges {
-    Write-Host "  - Reverting Admin changes..." -ForegroundColor Yellow
-    if ($state.DemotedAdmins.Count -gt 0) {
-        foreach ($user in $state.DemotedAdmins) {
-            if ($PSCmdlet.ShouldProcess("user '$user'", "Adding back to Administrators group")) {
-                Write-Host "    - Re-promoting user '$user' to Administrators."
-                net localgroup Administrators $user /add
-            }
-        }
-    }
-    if ($PSCmdlet.ShouldProcess("user '$($state.NewAdminName)'", "Deleting account")) {
-        Write-Host "    - Deleting user '$($state.NewAdminName)'."
-        net user $state.NewAdminName /delete
-    }
-}
-
-function Undo-LapsAndBuiltinAdmin {
-    Write-Host "  - Reverting LAPS configuration and built-in Admin state..." -ForegroundColor Yellow
+function Undo-Laps {
+    Write-Host "  - Reverting LAPS policy (account state untouched)..." -ForegroundColor Yellow
     switch ($state.LapsConfigured) {
         "Modern" {
             if ($PSCmdlet.ShouldProcess("Modern LAPS Policy", "Disabling")) {
@@ -67,14 +63,8 @@ function Undo-LapsAndBuiltinAdmin {
             }
         }
         "None" {
-             Write-Host "  - No LAPS was configured. Reverting built-in Admin to its original state only."
+             Write-Host "  - No LAPS was configured by the hardening run. Nothing to revert."
         }
-    }
-    # Always revert the built-in admin to its original recorded state
-    $originalState = if ($state.BuiltinAdminState) { "yes" } else { "no" }
-    if ($PSCmdlet.ShouldProcess("Administrator Account", "Setting active state to '$($originalState)'")) {
-        net user Administrator /active:$originalState
-        Write-Host "    - Built-in Administrator account active state reverted to '$originalState'."
     }
 }
 
@@ -153,40 +143,39 @@ do {
     Clear-Host
     Write-Host "--- Hardening Rollback Script ---" -ForegroundColor Cyan
     Write-Host "Reading state from: $stateFile`n"
+    Write-Host "NOTE: Account changes (SecOpsAdm, demotions, built-in Administrator) are NOT reversed by this script." -ForegroundColor DarkGray
+    Write-Host "      Manage those manually if needed.`n" -ForegroundColor DarkGray
     Write-Host "Select the action to perform:"
-    Write-Host " 1) Undo Admin Account Changes"
-    Write-Host " 2) Undo LAPS & Built-in Admin State"
-    Write-Host " 3) Undo Defender Hardening"
-    Write-Host " 4) Undo BitLocker Encryption (HIGH RISK)"
-    Write-Host " 5) Undo Agent Installations (Wazuh/Sysmon)"
-    Write-Host " 6) Undo WDAC Policy (Reboot Required)"
-    Write-Host " 7) Undo Firewall Hardening"
-    Write-Host " 8) Undo Remote Access Disabling"
-    Write-Host " 9) === UNDO ALL APPLIED CHANGES ===" -ForegroundColor Yellow
+    Write-Host " 1) Undo LAPS Policy"
+    Write-Host " 2) Undo Defender Hardening"
+    Write-Host " 3) Undo BitLocker Encryption (HIGH RISK)"
+    Write-Host " 4) Undo Agent Installations (Wazuh/Sysmon)"
+    Write-Host " 5) Undo WDAC Policy (Reboot Required)"
+    Write-Host " 6) Undo Firewall Hardening"
+    Write-Host " 7) Undo Remote Access Disabling"
+    Write-Host " 9) === UNDO ALL APPLIED CHANGES (non-account) ===" -ForegroundColor Yellow
     Write-Host " Q) Quit"
 
     $choice = Read-Host "`nEnter your choice"
 
     switch ($choice) {
-        '1' { Undo-AdminChanges }
-        '2' { Undo-LapsAndBuiltinAdmin }
-        '3' { Undo-Defender }
-        '4' { Undo-BitLocker }
-        '5' { Undo-Agents }
-        '6' { Undo-WDAC }
-        '7' { Undo-Firewall }
-        '8' { Undo-RemoteAccess }
+        '1' { Undo-Laps }
+        '2' { Undo-Defender }
+        '3' { Undo-BitLocker }
+        '4' { Undo-Agents }
+        '5' { Undo-WDAC }
+        '6' { Undo-Firewall }
+        '7' { Undo-RemoteAccess }
         '9' {
-            Write-Host "`n--- PERFORMING FULL ROLLBACK ---`n" -ForegroundColor Yellow
-            Undo-AdminChanges
-            Undo-LapsAndBuiltinAdmin
+            Write-Host "`n--- PERFORMING FULL ROLLBACK (non-account) ---`n" -ForegroundColor Yellow
+            Undo-Laps
             Undo-Defender
             Undo-BitLocker
             Undo-Agents
             Undo-WDAC
             Undo-Firewall
             Undo-RemoteAccess
-            Write-Host "`nFull rollback sequence complete." -ForegroundColor Green
+            Write-Host "`nFull rollback sequence complete. Account changes were NOT reversed." -ForegroundColor Green
         }
     }
     if ($choice -ne 'q' -and $choice -ne '9') { Read-Host "Press Enter to return to the menu..." }
