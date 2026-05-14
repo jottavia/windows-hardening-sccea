@@ -144,23 +144,39 @@ function Undo-RustDesk {
         return
     }
     Write-Host "  - Uninstalling RustDesk..." -ForegroundColor Yellow
+    $done = $false
+    # 1. MSI path if state has one
     if ($ph.RustDesk.InstallerPath -and (Test-Path $ph.RustDesk.InstallerPath) -and ($ph.RustDesk.InstallerPath -like '*.msi')) {
         if ($PSCmdlet.ShouldProcess($ph.RustDesk.InstallerPath, "msiexec /x")) {
             Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x', "`"$($ph.RustDesk.InstallerPath)`"", '/qn', '/norestart') -Wait }
+            $done = $true
         }
-    } else {
+    }
+    # 2. Official RustDesk uninstall: 'rustdesk.exe --uninstall' (silent, no /S).
+    #    Use the ExePath we recorded if available; otherwise check the default path.
+    if (-not $done) {
+        $exe = $null
+        if ($ph.RustDesk.ExePath -and (Test-Path $ph.RustDesk.ExePath)) {
+            $exe = $ph.RustDesk.ExePath
+        } elseif (Test-Path 'C:\Program Files\RustDesk\rustdesk.exe') {
+            $exe = 'C:\Program Files\RustDesk\rustdesk.exe'
+        }
+        if ($exe -and $PSCmdlet.ShouldProcess("RustDesk", "$exe --uninstall")) {
+            Start-Process -FilePath $exe -ArgumentList '--uninstall' -Wait -WindowStyle Hidden
+            $done = $true
+        }
+    }
+    # 3. Fallback: registry UninstallString (which is normally "...rustdesk.exe" --uninstall)
+    if (-not $done) {
         $u = Get-UninstallEntry -DisplayNamePattern 'RustDesk*'
-        if ($u) {
-            if ($u.QuietUninstallString) {
-                if ($PSCmdlet.ShouldProcess("RustDesk", $u.QuietUninstallString)) {
-                    Start-Process cmd -ArgumentList @('/c', $u.QuietUninstallString) -Wait
-                }
-            } elseif ($u.UninstallString) {
-                if ($u.UninstallString -match 'msiexec' -and $u.UninstallString -match '({[A-F0-9-]+})') {
+        if ($u -and ($u.QuietUninstallString -or $u.UninstallString)) {
+            $cmdStr = if ($u.QuietUninstallString) { $u.QuietUninstallString } else { $u.UninstallString }
+            if ($PSCmdlet.ShouldProcess("RustDesk", $cmdStr)) {
+                if ($cmdStr -match 'msiexec' -and $cmdStr -match '({[A-F0-9-]+})') {
                     $guid = $Matches[1]
                     Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x',$guid,'/qn','/norestart') -Wait }
                 } else {
-                    Start-Process cmd -ArgumentList @('/c', "$($u.UninstallString) /S") -Wait
+                    Start-Process cmd -ArgumentList @('/c', $cmdStr) -Wait -WindowStyle Hidden
                 }
             }
         } else {

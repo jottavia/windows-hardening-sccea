@@ -436,17 +436,32 @@ function Invoke-Action-InstallRustDesk {
                 Restart-Service -Name $info.ServiceName -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 3
             }
-            # Verify by reading the config back
+            # Verify by reading the config back.
+            # RustDesk has no --get-option; the single-arg form 'rustdesk --option <name>'
+            # prints the current value via println!. The rustdesk binary is built for the
+            # Windows subsystem (GUI) so stdout is not attached to the parent PowerShell
+            # console; redirect it to a temp file via Start-Process -RedirectStandardOutput.
             try {
-                $reported = (& $rustdeskExe --get-option custom-rendezvous-server 2>$null | Out-String).Trim()
-                if ($reported -eq $Server) {
+                $tmpOut = [System.IO.Path]::GetTempFileName()
+                try {
+                    Start-Process -FilePath $rustdeskExe `
+                                  -ArgumentList @('--option','custom-rendezvous-server') `
+                                  -Wait -WindowStyle Hidden `
+                                  -RedirectStandardOutput $tmpOut `
+                                  -ErrorAction SilentlyContinue | Out-Null
+                    $reported = (Get-Content -Path $tmpOut -Raw -ErrorAction SilentlyContinue) -as [string]
+                    if ($reported) { $reported = $reported.Trim() }
+                } finally {
+                    Remove-Item -Path $tmpOut -Force -ErrorAction SilentlyContinue
+                }
+                if ($reported -and $reported -eq $Server) {
                     $configVerified = $true
                     Write-ConsoleLog "RustDesk self-hosted config verified: $Server"
                 } else {
-                    Write-ConsoleLog "[WARN] RustDesk --get-option returned '$reported'; expected '$Server'. The service-side config may need a custom-built installer from rustdesk.com." 'WARN'
+                    Write-ConsoleLog "[WARN] RustDesk read-back returned '$reported'; expected '$Server'. The service-side config may need a custom-built installer from rustdesk.com." 'WARN'
                 }
             } catch {
-                Write-ConsoleLog "[WARN] Could not verify RustDesk config via --get-option: $_" 'WARN'
+                Write-ConsoleLog "[WARN] Could not verify RustDesk config: $_" 'WARN'
             }
         }
 
@@ -509,7 +524,7 @@ function Invoke-Action-UninstallRustDesk {
         $exitCode = -1
         $msiExitOk = @(0, 1605, 3010)   # 0=ok, 1605=product not installed, 3010=reboot pending
 
-        # 1. Prefer the original MSI from state if available
+        # 1. If we recorded an MSI installer path in state, try that (msiexec /x)
         if ($rdState -and $rdState.InstallerPath -and (Test-Path $rdState.InstallerPath) -and ($rdState.InstallerPath -like '*.msi')) {
             $proc = Invoke-WithMsiAllowed {
                 Start-Process msiexec -ArgumentList @('/x', "`"$($rdState.InstallerPath)`"", '/qn', '/norestart') -Wait -PassThru
@@ -517,37 +532,30 @@ function Invoke-Action-UninstallRustDesk {
             $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
             $uninstalled = ($exitCode -in $msiExitOk)
         }
-        # 2. Try a known NSIS uninstaller in the install path
-        if (-not $uninstalled -and $info.InstallPath) {
-            $uninsCandidate = @('uninstall.exe','Uninstall.exe','unins000.exe') |
-                              ForEach-Object { Join-Path $info.InstallPath $_ } |
-                              Where-Object { Test-Path $_ } |
-                              Select-Object -First 1
-            if ($uninsCandidate) {
-                $proc = Start-Process -FilePath $uninsCandidate -ArgumentList '/S' -Wait -PassThru
-                $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
-                $uninstalled = ($exitCode -eq 0)
-            }
+        # 2. RustDesk's official Windows uninstall path: 'rustdesk.exe --uninstall'.
+        #    There is NO standalone uninstaller exe (no unins000.exe, no Uninstall.exe).
+        #    The --uninstall switch runs an internal batch that removes the service,
+        #    deletes files, and clears the registry. It is itself silent.
+        if (-not $uninstalled -and $info.ExePath) {
+            $proc = Start-Process -FilePath $info.ExePath -ArgumentList '--uninstall' -Wait -PassThru -WindowStyle Hidden
+            $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+            $uninstalled = ($exitCode -eq 0)
         }
-        # 3. Fall back to the registry's UninstallString
+        # 3. Last resort: registry's UninstallString (which is typically just
+        #    "...rustdesk.exe" --uninstall but may differ on custom builds).
         if (-not $uninstalled) {
             $u = Get-UninstallEntry -DisplayNamePattern 'RustDesk*'
-            if ($u) {
-                if ($u.QuietUninstallString) {
-                    $proc = Start-Process cmd -ArgumentList @('/c', $u.QuietUninstallString) -Wait -PassThru
+            if ($u -and ($u.QuietUninstallString -or $u.UninstallString)) {
+                $cmdStr = if ($u.QuietUninstallString) { $u.QuietUninstallString } else { $u.UninstallString }
+                if ($cmdStr -match 'msiexec' -and $cmdStr -match '({[A-F0-9-]+})') {
+                    $guid = $Matches[1]
+                    $proc = Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x',$guid,'/qn','/norestart') -Wait -PassThru }
+                    $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+                    $uninstalled = ($exitCode -in $msiExitOk)
+                } else {
+                    $proc = Start-Process cmd -ArgumentList @('/c', $cmdStr) -Wait -PassThru -WindowStyle Hidden
                     $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
                     $uninstalled = ($exitCode -eq 0)
-                } elseif ($u.UninstallString) {
-                    if ($u.UninstallString -match 'msiexec' -and $u.UninstallString -match '({[A-F0-9-]+})') {
-                        $guid = $Matches[1]
-                        $proc = Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x',$guid,'/qn','/norestart') -Wait -PassThru }
-                        $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
-                        $uninstalled = ($exitCode -in $msiExitOk)
-                    } else {
-                        $proc = Start-Process cmd -ArgumentList @('/c', "$($u.UninstallString) /S") -Wait -PassThru
-                        $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
-                        $uninstalled = ($exitCode -eq 0)
-                    }
                 }
             }
         }
