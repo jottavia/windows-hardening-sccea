@@ -225,6 +225,64 @@ function Remove-OutboundAllowRule {
     }
 }
 
+# Poll for service appearance/disappearance after an installer/uninstaller call.
+function Wait-ServicePresent {
+    param(
+        [Parameter(Mandatory=$true)][string]$ServicePattern,
+        [int]$TimeoutSeconds = 60
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Get-Service -Name $ServicePattern -ErrorAction SilentlyContinue) { return $true }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
+function Wait-ServiceAbsent {
+    param(
+        [Parameter(Mandatory=$true)][string]$ServicePattern,
+        [int]$TimeoutSeconds = 30
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Service -Name $ServicePattern -ErrorAction SilentlyContinue)) { return $true }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
+# Detect RustDesk install state from registry + filesystem + services.
+# Returns a PSCustomObject with: Installed, InstallPath, ExePath, ServiceName, ServiceStatus.
+function Get-RustDeskInstallInfo {
+    $u = Get-UninstallEntry -DisplayNamePattern 'RustDesk*'
+    $installPath = $null
+    if ($u -and $u.InstallLocation) {
+        $installPath = $u.InstallLocation.TrimEnd('\')
+    } elseif (Test-Path $script:Config.RustDeskInstallDir) {
+        $installPath = $script:Config.RustDeskInstallDir
+    }
+
+    $exePath = $null
+    if ($installPath) {
+        $candidate = Join-Path $installPath 'rustdesk.exe'
+        if (Test-Path $candidate) { $exePath = $candidate }
+    }
+
+    $service = Get-Service -Name 'rustdesk*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $service) {
+        $service = Get-Service -DisplayName 'RustDesk*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+
+    return [PSCustomObject]@{
+        Installed     = [bool]($exePath -or $service)
+        InstallPath   = $installPath
+        ExePath       = $exePath
+        ServiceName   = if ($service) { $service.Name } else { $null }
+        ServiceStatus = if ($service) { $service.Status.ToString() } else { 'NotFound' }
+    }
+}
+
 #===========================================================================
 # =================== ACTIONS (extend below for new toggles) ================
 #===========================================================================
@@ -299,11 +357,21 @@ function Invoke-Action-InstallRustDesk {
     if (-not (Get-HardeningState)) {
         return @{ Ok = $false; Message = "No hardening log folder; run hardening first." }
     }
-    $installer = Find-FileByPatterns -Patterns @($script:Config.RustDeskMsiPattern, $script:Config.RustDeskInstallerPattern)
-    if (-not $installer) {
-        return @{ Ok = $false; Message = "RustDesk installer not found on USB (looked for $($script:Config.RustDeskMsiPattern), $($script:Config.RustDeskInstallerPattern))." }
+
+    # Pre-flight: detect existing install
+    $info = Get-RustDeskInstallInfo
+    $skipInstall = $info.Installed
+    $installer = $null
+    if (-not $skipInstall) {
+        $installer = Find-FileByPatterns -Patterns @($script:Config.RustDeskMsiPattern, $script:Config.RustDeskInstallerPattern)
+        if (-not $installer) {
+            return @{ Ok = $false; Message = "RustDesk installer not found on USB (looked for $($script:Config.RustDeskMsiPattern), $($script:Config.RustDeskInstallerPattern))." }
+        }
+    } else {
+        Write-ConsoleLog "RustDesk already installed at $($info.InstallPath); refreshing config/firewall/exclusions"
     }
 
+    # Self-hosted config resolution (server/key from form, then USB files)
     if ($Mode -eq 'SelfHosted') {
         if (-not $Server) {
             $serverFile = Join-Path $script:ScriptRoot $script:Config.RustDeskServerFile
@@ -319,36 +387,78 @@ function Invoke-Action-InstallRustDesk {
     }
 
     try {
-        Write-ConsoleLog "RustDesk install starting from $installer (mode=$Mode)"
-        $ext = [System.IO.Path]::GetExtension($installer).ToLower()
-        Invoke-WithMsiAllowed {
-            if ($ext -eq '.msi') {
-                Start-Process msiexec -ArgumentList @('/i', "`"$installer`"", '/qn', '/norestart') -Wait
-            } else {
-                Start-Process -FilePath $installer -ArgumentList '--silent-install' -Wait
+        # ---- Run installer if needed ----
+        if (-not $skipInstall) {
+            Write-ConsoleLog "RustDesk install starting from $installer (mode=$Mode)"
+            $ext = [System.IO.Path]::GetExtension($installer).ToLower()
+            $proc = Invoke-WithMsiAllowed {
+                if ($ext -eq '.msi') {
+                    Start-Process msiexec -ArgumentList @('/i', "`"$installer`"", '/qn', '/norestart') -Wait -PassThru
+                } else {
+                    Start-Process -FilePath $installer -ArgumentList '--silent-install' -Wait -PassThru
+                }
             }
-        }
-        Start-Sleep -Seconds 3
+            $code = if ($proc) { $proc.ExitCode } else { -1 }
+            # 0 = success, 3010 = success + reboot pending (msiexec)
+            if ($code -notin @(0, 3010)) {
+                Write-ConsoleLog "[ERROR] RustDesk installer exit code $code" 'ERROR'
+                return @{ Ok = $false; Message = "RustDesk installer exited with code $code. Install failed." }
+            }
 
-        # Configure self-hosted server if requested
-        $rustdeskExe = Join-Path $script:Config.RustDeskInstallDir 'rustdesk.exe'
-        if ($Mode -eq 'SelfHosted' -and (Test-Path $rustdeskExe)) {
-            Start-Process -FilePath $rustdeskExe -ArgumentList @('--option','custom-rendezvous-server',$Server) -Wait -WindowStyle Hidden
+            # Wait for the rustdesk service to appear (up to 60s)
+            if (-not (Wait-ServicePresent -ServicePattern 'rustdesk*' -TimeoutSeconds 60)) {
+                Write-ConsoleLog "[ERROR] RustDesk service did not appear within 60 seconds after install" 'ERROR'
+                return @{ Ok = $false; Message = "RustDesk installer returned $code but the service did not appear. Install incomplete." }
+            }
+            Start-Sleep -Seconds 2
+            $info = Get-RustDeskInstallInfo
+            if (-not $info.ExePath) {
+                Write-ConsoleLog "[ERROR] RustDesk service is present but rustdesk.exe could not be located" 'ERROR'
+                return @{ Ok = $false; Message = "RustDesk service is present but rustdesk.exe was not found in any known location." }
+            }
+            Write-ConsoleLog "RustDesk install verified. ExePath=$($info.ExePath) Service=$($info.ServiceName)/$($info.ServiceStatus)"
+        }
+
+        # ---- Self-hosted config (user + service config), then service restart, then verify ----
+        $configVerified = $false
+        if ($Mode -eq 'SelfHosted') {
+            $rustdeskExe = $info.ExePath
+            if (-not $rustdeskExe -or -not (Test-Path $rustdeskExe)) {
+                return @{ Ok = $false; Message = "RustDesk binary not found; cannot apply self-hosted config." }
+            }
+            # Apply via the CLI option (writes user-mode config)
+            Start-Process -FilePath $rustdeskExe -ArgumentList @('--option','custom-rendezvous-server',$Server) -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
             if ($Key) {
-                Start-Process -FilePath $rustdeskExe -ArgumentList @('--option','key',$Key) -Wait -WindowStyle Hidden
+                Start-Process -FilePath $rustdeskExe -ArgumentList @('--option','key',$Key) -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
             }
-            Write-ConsoleLog "RustDesk configured for self-hosted server: $Server"
+            # Restart the RustDesk service so the service-side config also picks up
+            if ($info.ServiceName) {
+                Restart-Service -Name $info.ServiceName -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+            }
+            # Verify by reading the config back
+            try {
+                $reported = (& $rustdeskExe --get-option custom-rendezvous-server 2>$null | Out-String).Trim()
+                if ($reported -eq $Server) {
+                    $configVerified = $true
+                    Write-ConsoleLog "RustDesk self-hosted config verified: $Server"
+                } else {
+                    Write-ConsoleLog "[WARN] RustDesk --get-option returned '$reported'; expected '$Server'. The service-side config may need a custom-built installer from rustdesk.com." 'WARN'
+                }
+            } catch {
+                Write-ConsoleLog "[WARN] Could not verify RustDesk config via --get-option: $_" 'WARN'
+            }
         }
 
-        # Firewall rules
+        # ---- Firewall rules ----
         $ruleNames = @()
         foreach ($r in $script:Config.RustDeskClientPorts) {
             Add-OutboundAllowRule -Name $r.Name -Protocol $r.Protocol -RemotePort $r.Port
             $ruleNames += $r.Name
         }
 
-        # Defender exclusion for install dir
-        $exclusionPath = $script:Config.RustDeskInstallDir
+        # ---- Defender exclusion ----
+        $exclusionPath = if ($info.InstallPath) { $info.InstallPath } else { $script:Config.RustDeskInstallDir }
         $defAdded = $false
         if (Test-Path $exclusionPath) {
             Add-MpPreference -AttackSurfaceReductionOnlyExclusions $exclusionPath -ErrorAction SilentlyContinue
@@ -356,20 +466,31 @@ function Invoke-Action-InstallRustDesk {
             Write-ConsoleLog "Defender ASR exclusion added: $exclusionPath"
         }
 
+        # ---- Record verified state ----
         Update-PostHardeningState {
             param($ph)
             $ph.RustDesk = [PSCustomObject]@{
                 Installed          = $true
                 Mode               = $Mode
                 Server             = $Server
+                ConfigVerified     = $configVerified
                 InstallerPath      = $installer
+                InstallPath        = $info.InstallPath
+                ExePath            = $info.ExePath
+                ServiceName        = $info.ServiceName
+                ServiceStatus      = $info.ServiceStatus
                 FirewallRules      = $ruleNames
                 DefenderExclusions = if ($defAdded) { @($exclusionPath) } else { @() }
                 Timestamp          = (Get-Date -Format 'o')
             }
         } | Out-Null
 
-        return @{ Ok = $true; Message = "RustDesk installed ($Mode). Firewall + Defender exclusions applied." }
+        $note = ''
+        if ($Mode -eq 'SelfHosted' -and -not $configVerified) {
+            $note = ' WARNING: self-hosted config could not be read back; the service may still use public relays. Consider a custom-built installer from rustdesk.com for guaranteed service-side config.'
+        }
+        $svcText = if ($info.ServiceName) { "$($info.ServiceName)/$($info.ServiceStatus)" } else { 'no service detected' }
+        return @{ Ok = $true; Message = "RustDesk installed ($Mode). Service: $svcText. Firewall + Defender exclusions applied.$note" }
     } catch {
         Write-ConsoleLog "[ERROR] RustDesk install failed: $_" 'ERROR'
         return @{ Ok = $false; Message = "RustDesk install failed: $($_.Exception.Message)" }
@@ -381,40 +502,68 @@ function Invoke-Action-UninstallRustDesk {
     if (-not $h) { return @{ Ok = $false; Message = "No hardening log folder found." } }
 
     try {
-        # Try state first
         $rdState = $h.State.PostHardening.RustDesk
-        $uninstalled = $false
+        $info = Get-RustDeskInstallInfo
 
+        $uninstalled = $false
+        $exitCode = -1
+        $msiExitOk = @(0, 1605, 3010)   # 0=ok, 1605=product not installed, 3010=reboot pending
+
+        # 1. Prefer the original MSI from state if available
         if ($rdState -and $rdState.InstallerPath -and (Test-Path $rdState.InstallerPath) -and ($rdState.InstallerPath -like '*.msi')) {
-            Invoke-WithMsiAllowed {
-                Start-Process msiexec -ArgumentList @('/x', "`"$($rdState.InstallerPath)`"", '/qn', '/norestart') -Wait
+            $proc = Invoke-WithMsiAllowed {
+                Start-Process msiexec -ArgumentList @('/x', "`"$($rdState.InstallerPath)`"", '/qn', '/norestart') -Wait -PassThru
             }
-            $uninstalled = $true
-        } else {
+            $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+            $uninstalled = ($exitCode -in $msiExitOk)
+        }
+        # 2. Try a known NSIS uninstaller in the install path
+        if (-not $uninstalled -and $info.InstallPath) {
+            $uninsCandidate = @('uninstall.exe','Uninstall.exe','unins000.exe') |
+                              ForEach-Object { Join-Path $info.InstallPath $_ } |
+                              Where-Object { Test-Path $_ } |
+                              Select-Object -First 1
+            if ($uninsCandidate) {
+                $proc = Start-Process -FilePath $uninsCandidate -ArgumentList '/S' -Wait -PassThru
+                $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+                $uninstalled = ($exitCode -eq 0)
+            }
+        }
+        # 3. Fall back to the registry's UninstallString
+        if (-not $uninstalled) {
             $u = Get-UninstallEntry -DisplayNamePattern 'RustDesk*'
             if ($u) {
                 if ($u.QuietUninstallString) {
-                    Start-Process cmd -ArgumentList @('/c', $u.QuietUninstallString) -Wait
-                    $uninstalled = $true
+                    $proc = Start-Process cmd -ArgumentList @('/c', $u.QuietUninstallString) -Wait -PassThru
+                    $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+                    $uninstalled = ($exitCode -eq 0)
                 } elseif ($u.UninstallString) {
-                    # Try adding /S for NSIS-style installers
-                    $cmd = $u.UninstallString
-                    if ($cmd -match 'msiexec' -and $cmd -match '({[A-F0-9-]+})') {
+                    if ($u.UninstallString -match 'msiexec' -and $u.UninstallString -match '({[A-F0-9-]+})') {
                         $guid = $Matches[1]
-                        Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x',$guid,'/qn','/norestart') -Wait }
+                        $proc = Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x',$guid,'/qn','/norestart') -Wait -PassThru }
+                        $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+                        $uninstalled = ($exitCode -in $msiExitOk)
                     } else {
-                        Start-Process cmd -ArgumentList @('/c', "$cmd /S") -Wait
+                        $proc = Start-Process cmd -ArgumentList @('/c', "$($u.UninstallString) /S") -Wait -PassThru
+                        $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+                        $uninstalled = ($exitCode -eq 0)
                     }
-                    $uninstalled = $true
                 }
             }
         }
 
-        # Remove firewall rules
+        # Wait for the rustdesk service to disappear (up to 30s)
+        $serviceGone = $true
+        if ($info.ServiceName) {
+            $serviceGone = Wait-ServiceAbsent -ServicePattern $info.ServiceName -TimeoutSeconds 30
+            if (-not $serviceGone) {
+                Write-ConsoleLog "[WARN] RustDesk uninstaller returned but '$($info.ServiceName)' service is still present after 30s" 'WARN'
+            }
+        }
+
+        # Cleanup firewall + Defender exclusions regardless
         $names = if ($rdState -and $rdState.FirewallRules) { $rdState.FirewallRules } else { $script:Config.RustDeskClientPorts | ForEach-Object { $_.Name } }
         foreach ($n in $names) { Remove-OutboundAllowRule -Name $n }
-
-        # Remove Defender exclusions
         if ($rdState -and $rdState.DefenderExclusions) {
             foreach ($p in $rdState.DefenderExclusions) {
                 Remove-MpPreference -AttackSurfaceReductionOnlyExclusions $p -ErrorAction SilentlyContinue
@@ -427,10 +576,12 @@ function Invoke-Action-UninstallRustDesk {
             $ph.RustDesk = $null
         } | Out-Null
 
-        if ($uninstalled) {
-            return @{ Ok = $true; Message = "RustDesk uninstalled. Firewall + Defender exclusions cleared." }
+        if ($uninstalled -and $serviceGone) {
+            return @{ Ok = $true; Message = "RustDesk uninstalled (exit $exitCode). Firewall + Defender exclusions cleared." }
+        } elseif ($uninstalled) {
+            return @{ Ok = $true; Message = "RustDesk uninstalled (exit $exitCode) but service is still present. May need a reboot. Firewall + Defender cleared." }
         } else {
-            return @{ Ok = $false; Message = "RustDesk installer/uninstaller not found. Cleanup of firewall + Defender done." }
+            return @{ Ok = $false; Message = "RustDesk uninstall did not complete cleanly (exit $exitCode). Firewall + Defender cleaned anyway." }
         }
     } catch {
         return @{ Ok = $false; Message = "RustDesk uninstall failed: $($_.Exception.Message)" }
@@ -449,14 +600,31 @@ function Invoke-Action-InstallTailscale {
     try {
         Write-ConsoleLog "Tailscale install starting from $installer"
         $ext = [System.IO.Path]::GetExtension($installer).ToLower()
-        Invoke-WithMsiAllowed {
+        $proc = Invoke-WithMsiAllowed {
             if ($ext -eq '.msi') {
-                Start-Process msiexec -ArgumentList @('/i', "`"$installer`"", '/qn', '/norestart') -Wait
+                Start-Process msiexec -ArgumentList @('/i', "`"$installer`"", '/qn', '/norestart') -Wait -PassThru
             } else {
-                Start-Process -FilePath $installer -ArgumentList '/S' -Wait
+                Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
             }
         }
-        Start-Sleep -Seconds 3
+        $code = if ($proc) { $proc.ExitCode } else { -1 }
+        if ($code -notin @(0, 3010)) {
+            Write-ConsoleLog "[ERROR] Tailscale installer exit code $code" 'ERROR'
+            return @{ Ok = $false; Message = "Tailscale installer exited with code $code. Install failed." }
+        }
+
+        # Wait for the Tailscale service to appear
+        if (-not (Wait-ServicePresent -ServicePattern 'Tailscale*' -TimeoutSeconds 60)) {
+            return @{ Ok = $false; Message = "Tailscale installer returned $code but the service did not appear. Install incomplete." }
+        }
+        Start-Sleep -Seconds 2
+
+        $exePath = Join-Path $script:Config.TailscaleInstallDir 'tailscale.exe'
+        if (-not (Test-Path $exePath)) {
+            return @{ Ok = $false; Message = "Tailscale service is present but tailscale.exe was not found at $exePath." }
+        }
+        $svc = Get-Service -Name 'Tailscale*' -ErrorAction SilentlyContinue | Select-Object -First 1
+        Write-ConsoleLog "Tailscale install verified. ExePath=$exePath Service=$($svc.Name)/$($svc.Status)"
 
         # Firewall: outbound UDP 41641 for direct connections
         $ruleName = 'Tailscale-Direct-UDP'
@@ -476,13 +644,16 @@ function Invoke-Action-InstallTailscale {
             $ph.Tailscale = [PSCustomObject]@{
                 Installed          = $true
                 InstallerPath      = $installer
+                ExePath            = $exePath
+                ServiceName        = if ($svc) { $svc.Name } else { $null }
+                ServiceStatus      = if ($svc) { $svc.Status.ToString() } else { $null }
                 FirewallRules      = @($ruleName)
                 DefenderExclusions = if ($defAdded) { @($exclusionPath) } else { @() }
                 Timestamp          = (Get-Date -Format 'o')
             }
         } | Out-Null
 
-        return @{ Ok = $true; Message = "Tailscale installed. Click 'Login' to authenticate via browser." }
+        return @{ Ok = $true; Message = "Tailscale installed. Service: $($svc.Name)/$($svc.Status). Click 'Login' to authenticate via browser." }
     } catch {
         Write-ConsoleLog "[ERROR] Tailscale install failed: $_" 'ERROR'
         return @{ Ok = $false; Message = "Tailscale install failed: $($_.Exception.Message)" }
