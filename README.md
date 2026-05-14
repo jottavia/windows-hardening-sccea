@@ -100,11 +100,35 @@ This script applies the security configurations and collects the initial complia
    * **To Demote Specific Admins:**  
      .\\Unified-Hardening.ps1 \-UsersToDemote "OldAdmin", "TempUser"
 
+   * **To pre-stage LAPS on a non-domain-joined machine** (LAPS cannot *function* without AD, but you may want the policy pre-configured for a future domain join):  
+     .\\Unified-Hardening.ps1 \-ForceLAPS
+
 5. **Completion:** Once finished, the script will have created a folder named PC-\<ComputerName\>-LOGS on your drive. Eject and securely store the USB drive immediately.
+
+### **LAPS and domain join**
+
+LAPS (Local Administrator Password Solution) cannot rotate passwords on machines that are not joined to Active Directory. As of v9.2 the hardening script auto-detects domain membership via `(Get-CimInstance Win32_ComputerSystem).PartOfDomain`:
+
+| Scenario | Default behavior |
+|:--|:--|
+| Domain-joined (modern LAPS cmdlet present) | Configure modern LAPS, enable built-in Administrator. |
+| Domain-joined (legacy LAPS MSI on USB) | Install + configure legacy LAPS, enable built-in Administrator. |
+| **Not** domain-joined, `-ForceLAPS` not specified | **Skip LAPS**, disable the built-in Administrator account as a compensating control. |
+| Not domain-joined, `-ForceLAPS` specified | Configure LAPS anyway (will only become functional after the machine joins a domain). |
 
 ## **Part 2: The Rollback Script (Undo-Hardening.ps1)**
 
-Use this script to safely revert the system to its pre-hardened state.
+Use this script to safely revert the **non-account** portions of the hardened baseline.
+
+### **Account changes are intentionally NOT reversed**
+
+As of v9.2, this script does **not** reverse:
+
+* Creation of the `SecOpsAdm` administrator account.
+* Demotion of users named via `-UsersToDemote`.
+* Enable/disable state of the built-in `Administrator`.
+
+Once a machine has been hardened those accounts form the live security posture. Reversing them would lock out the operator (who is now signed in as `SecOpsAdm`) and silently re-grant privileges that were intentionally removed. Manage account state directly if needed.
 
 ### **Usage**
 
@@ -113,7 +137,7 @@ Use this script to safely revert the system to its pre-hardened state.
 3. **Execute:** Run the script, pointing it to the correct log folder for the machine you are on.  
    .\\Undo-Hardening.ps1 \-LogFolderPath "E:\\PC-WORKSTATION-01-LOGS"
 
-4. **Follow the Menu:** The interactive menu will prompt you to undo specific changes, such as 'Admin Account Changes', 'Defender Hardening', 'BitLocker Encryption', and 'Remote Access Disabling'. You can also choose the 'UNDO ALL' option to revert all applied settings in sequence. Be aware of high-risk actions that may require a reboot.
+4. **Follow the Menu:** The interactive menu will prompt you to undo specific non-account changes: LAPS policy, Defender hardening, BitLocker encryption, agent installs, WDAC policy, firewall hardening, and remote-access disabling. You can also choose 'UNDO ALL' to revert every non-account setting in sequence. Be aware of high-risk actions that may require a reboot.
 
 ## **Part 3: The Exclusion Management GUI (Add-DefenderExclusion-GUI.ps1)**
 

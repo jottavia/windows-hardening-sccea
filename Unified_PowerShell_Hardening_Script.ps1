@@ -12,7 +12,8 @@
 [CmdletBinding()]
 param(
     [string[]]$UsersToDemote = @(),
-    [string]$WazuhManagerIP = '192.168.1.100'
+    [string]$WazuhManagerIP = '192.168.1.100',
+    [switch]$ForceLAPS
 )
 
 #===========================================================================
@@ -254,7 +255,24 @@ try {
 
 # --- 2. LAPS CONFIGURATION ---
 Write-Host "[2] Configuring Local Administrator Password Solution (LAPS)..." -ForegroundColor Green
-if (Get-Command -Name Set-LapsPolicy -ErrorAction SilentlyContinue) {
+$isDomainJoined = $false
+try { $isDomainJoined = [bool](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch { $isDomainJoined = $false }
+
+if (-not $isDomainJoined -and -not $ForceLAPS) {
+    Write-Host "  [INFO] Machine is not domain-joined and -ForceLAPS not specified. LAPS cannot function" -ForegroundColor Yellow
+    Write-Host "         without AD; skipping LAPS configuration. Re-run with -ForceLAPS after joining a domain" -ForegroundColor Yellow
+    Write-Host "         (or to pre-stage policy for a future join)." -ForegroundColor Yellow
+    Write-SecLog "LAPS skipped: machine not domain-joined and -ForceLAPS not specified."
+    Write-Host "  - Applying compensating control: disabling built-in '$($config.BuiltinAdminName)' account."
+    try {
+        net user $config.BuiltinAdminName /active:no
+        if ((Get-LocalUser -Name $config.BuiltinAdminName).Enabled -eq $false) {
+            Write-Host "  [VERIFIED] Built-in '$($config.BuiltinAdminName)' account is disabled." -ForegroundColor Green
+            Write-SecLog "Built-in Administrator account disabled (LAPS skipped, no AD)."
+        } else { Write-Warning "  [FAILED] Could not verify built-in Administrator account is disabled." }
+    } catch { Write-Warning "  - Compensating-control disable failed: $_" }
+}
+elseif (Get-Command -Name Set-LapsPolicy -ErrorAction SilentlyContinue) {
     Write-Host "  - Modern LAPS detected. Applying policy."
     try {
         net user $config.BuiltinAdminName /active:yes
