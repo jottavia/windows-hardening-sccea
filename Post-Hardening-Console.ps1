@@ -631,8 +631,9 @@ function Invoke-Action-AddDefenderExclusion {
                 CFA       = $isExe
                 Timestamp = (Get-Date -Format 'o')
             }
-            $existing = @($ph.DefenderExclusionsAdded) | Where-Object { $_ -and $_.Path -ne $Path }
-            $ph.DefenderExclusionsAdded = @($existing) + $entry
+            # Wrap pipeline in @() so $kept is always a real array (avoids $null leaking in)
+            $kept = @($ph.DefenderExclusionsAdded | Where-Object { $_ -and $_.Path -ne $Path })
+            $ph.DefenderExclusionsAdded = $kept + $entry
         } | Out-Null
 
         return @{ Ok = $true; Message = "Exclusion added: $Path" }
@@ -685,7 +686,9 @@ function Invoke-Action-AddCustomFirewallRule {
                 Port      = $Port
                 Timestamp = (Get-Date -Format 'o')
             }
-            $ph.CustomFirewallRules = @(@($ph.CustomFirewallRules) + $entry)
+            # Defensive: keep $kept guaranteed-array even if state somehow has $null
+            $kept = @($ph.CustomFirewallRules | Where-Object { $_ -and $_.Name })
+            $ph.CustomFirewallRules = $kept + $entry
         } | Out-Null
 
         return @{ Ok = $true; Message = "Firewall rule added: $Name ($Protocol/$Port outbound)" }
@@ -1338,7 +1341,7 @@ plaintext on this drive. Remove the drive after use and store it securely.
 
     $btnOpenLog.Add_Click({
         $h = Get-HardeningState
-        if ($h) { Start-Process explorer.exe -ArgumentList $h.Folder }
+        if ($h) { Start-Process explorer.exe -ArgumentList "`"$($h.Folder)`"" }
         else    { [System.Windows.Forms.MessageBox]::Show("No hardening log folder found.", "Info", "OK", "Information") | Out-Null }
     }.GetNewClosure())
 
