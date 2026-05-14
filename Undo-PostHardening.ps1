@@ -92,30 +92,40 @@ function Undo-Tailscale {
         return
     }
     Write-Host "  - Uninstalling Tailscale..." -ForegroundColor Yellow
-    $exe = 'C:\Program Files\Tailscale\tailscale.exe'
-    if (Test-Path $exe) {
+    # Prefer the recorded ExePath; fall back to the default install location.
+    $exe = $null
+    if ($ph.Tailscale.ExePath -and (Test-Path $ph.Tailscale.ExePath)) {
+        $exe = $ph.Tailscale.ExePath
+    } elseif (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') {
+        $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+    }
+    if ($exe) {
         if ($PSCmdlet.ShouldProcess("tailscale", "logout")) {
             Start-Process -FilePath $exe -ArgumentList 'logout' -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
         }
     }
 
+    $done = $false
+    # 1. MSI path from state, if still reachable
     if ($ph.Tailscale.InstallerPath -and (Test-Path $ph.Tailscale.InstallerPath) -and ($ph.Tailscale.InstallerPath -like '*.msi')) {
         if ($PSCmdlet.ShouldProcess($ph.Tailscale.InstallerPath, "msiexec /x")) {
             Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x', "`"$($ph.Tailscale.InstallerPath)`"", '/qn', '/norestart') -Wait }
+            $done = $true
         }
-    } else {
+    }
+    # 2. Registry UninstallString (Tailscale MSI registers a ProductCode-keyed entry)
+    if (-not $done) {
         $u = Get-UninstallEntry -DisplayNamePattern 'Tailscale*'
-        if ($u) {
-            if ($u.QuietUninstallString) {
-                if ($PSCmdlet.ShouldProcess("Tailscale", $u.QuietUninstallString)) {
-                    Start-Process cmd -ArgumentList @('/c', $u.QuietUninstallString) -Wait
-                }
-            } elseif ($u.UninstallString) {
-                if ($u.UninstallString -match 'msiexec' -and $u.UninstallString -match '({[A-F0-9-]+})') {
+        if ($u -and ($u.QuietUninstallString -or $u.UninstallString)) {
+            $cmdStr = if ($u.QuietUninstallString) { $u.QuietUninstallString } else { $u.UninstallString }
+            if ($PSCmdlet.ShouldProcess("Tailscale", $cmdStr)) {
+                if ($cmdStr -match 'msiexec' -and $cmdStr -match '({[A-F0-9-]+})') {
                     $guid = $Matches[1]
                     Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x',$guid,'/qn','/norestart') -Wait }
                 } else {
-                    Start-Process cmd -ArgumentList @('/c', "$($u.UninstallString) /S") -Wait
+                    # The .exe bootstrapper has no documented silent-uninstall flag.
+                    # Run the UninstallString verbatim and let the user handle any prompt.
+                    Start-Process cmd -ArgumentList @('/c', $cmdStr) -Wait -WindowStyle Hidden
                 }
             }
         } else {

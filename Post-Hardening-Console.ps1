@@ -225,6 +225,27 @@ function Remove-OutboundAllowRule {
     }
 }
 
+# Program-based outbound allow. Use when a service binds to ephemeral / dynamic
+# ports (e.g. Tailscale's tailscaled - source port 41641 but remote port varies
+# per peer/NAT mapping) and a fixed -RemotePort rule would miss most traffic.
+function Add-OutboundProgramAllow {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Program
+    )
+    if (Test-FirewallRuleExists -Name $Name) {
+        Write-ConsoleLog "Firewall rule '$Name' already exists. Skipping."
+        return
+    }
+    if (-not (Test-Path $Program)) {
+        Write-ConsoleLog "[WARN] Program path not found for firewall rule '$Name': $Program" 'WARN'
+        return
+    }
+    New-NetFirewallRule -DisplayName $Name -Direction Outbound -Action Allow `
+        -Program $Program -Profile Any -Enabled True | Out-Null
+    Write-ConsoleLog "Firewall rule added: $Name (program: $Program outbound)"
+}
+
 # Poll for service appearance/disappearance after an installer/uninstaller call.
 function Wait-ServicePresent {
     param(
@@ -601,10 +622,23 @@ function Invoke-Action-InstallTailscale {
     if (-not (Get-HardeningState)) {
         return @{ Ok = $false; Message = "No hardening log folder; run hardening first." }
     }
-    $installer = Find-FileByPatterns -Patterns @($script:Config.TailscaleMsiPattern, $script:Config.TailscaleInstallerPattern)
+
+    # Strongly prefer the MSI. Tailscale ships tailscale-setup-X.Y.Z-amd64.msi
+    # alongside a .exe bootstrapper, and the .exe's silent flag is undocumented.
+    # The official deployment path (Intune, MDM) uses 'msiexec /i <msi> /qn'.
+    $installer = Find-FileByPatterns -Patterns @($script:Config.TailscaleMsiPattern)
+    $usedExeFallback = $false
     if (-not $installer) {
-        return @{ Ok = $false; Message = "Tailscale installer not found on USB." }
+        $installer = Find-FileByPatterns -Patterns @($script:Config.TailscaleInstallerPattern)
+        if ($installer) {
+            $usedExeFallback = $true
+            Write-ConsoleLog "[WARN] Falling back to Tailscale .exe installer; silent flag is not officially documented. Prefer the .msi (tailscale-setup-*.msi)." 'WARN'
+        }
     }
+    if (-not $installer) {
+        return @{ Ok = $false; Message = "Tailscale installer not found on USB (looked for $($script:Config.TailscaleMsiPattern), $($script:Config.TailscaleInstallerPattern))." }
+    }
+
     try {
         Write-ConsoleLog "Tailscale install starting from $installer"
         $ext = [System.IO.Path]::GetExtension($installer).ToLower()
@@ -612,6 +646,7 @@ function Invoke-Action-InstallTailscale {
             if ($ext -eq '.msi') {
                 Start-Process msiexec -ArgumentList @('/i', "`"$installer`"", '/qn', '/norestart') -Wait -PassThru
             } else {
+                # Best-effort silent flag for the .exe wrapper. May or may not be honored.
                 Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
             }
         }
@@ -621,22 +656,40 @@ function Invoke-Action-InstallTailscale {
             return @{ Ok = $false; Message = "Tailscale installer exited with code $code. Install failed." }
         }
 
-        # Wait for the Tailscale service to appear
+        # Wait for the Tailscale service to appear (service name is exactly 'Tailscale'
+        # per cmd/tailscaled/tailscaled_windows.go; wildcard still matches).
         if (-not (Wait-ServicePresent -ServicePattern 'Tailscale*' -TimeoutSeconds 60)) {
-            return @{ Ok = $false; Message = "Tailscale installer returned $code but the service did not appear. Install incomplete." }
+            $hint = if ($usedExeFallback) { ' The .exe installer may have launched its GUI instead of installing silently; close it and supply the MSI.' } else { '' }
+            return @{ Ok = $false; Message = "Tailscale installer returned $code but the service did not appear.$hint" }
         }
         Start-Sleep -Seconds 2
 
         $exePath = Join-Path $script:Config.TailscaleInstallDir 'tailscale.exe'
+        $tailscaledPath = Join-Path $script:Config.TailscaleInstallDir 'tailscaled.exe'
         if (-not (Test-Path $exePath)) {
             return @{ Ok = $false; Message = "Tailscale service is present but tailscale.exe was not found at $exePath." }
         }
         $svc = Get-Service -Name 'Tailscale*' -ErrorAction SilentlyContinue | Select-Object -First 1
-        Write-ConsoleLog "Tailscale install verified. ExePath=$exePath Service=$($svc.Name)/$($svc.Status)"
+        Write-ConsoleLog "Tailscale install verified. ExePath=$exePath ServiceBinary=$tailscaledPath Service=$($svc.Name)/$($svc.Status)"
 
-        # Firewall: outbound UDP 41641 for direct connections
-        $ruleName = 'Tailscale-Direct-UDP'
-        Add-OutboundAllowRule -Name $ruleName -Protocol UDP -RemotePort $script:Config.TailscalePortUDP
+        # Firewall: Tailscale binds to UDP source-port 41641 by default but talks to
+        # whatever remote port each peer / NAT mapping uses. A fixed -RemotePort
+        # rule would miss most traffic. Allow tailscaled.exe by program path
+        # instead - that matches every outbound it makes (UDP direct + HTTPS DERP
+        # fallback, though the DERP/443 path is already permitted by the
+        # hardening baseline's HTTPS-Out rule).
+        $ruleName = 'Tailscale-tailscaled-Outbound'
+        if (Test-Path $tailscaledPath) {
+            Add-OutboundProgramAllow -Name $ruleName -Program $tailscaledPath
+        } else {
+            Write-ConsoleLog "[WARN] tailscaled.exe not found at $tailscaledPath; falling back to source-port rule" 'WARN'
+            $ruleName = 'Tailscale-Direct-UDP-LocalPort'
+            if (-not (Test-FirewallRuleExists -Name $ruleName)) {
+                New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -Action Allow `
+                    -Protocol UDP -LocalPort $script:Config.TailscalePortUDP -Profile Any -Enabled True | Out-Null
+                Write-ConsoleLog "Firewall rule added: $ruleName (UDP local port $($script:Config.TailscalePortUDP) outbound)"
+            }
+        }
 
         # Defender exclusion
         $exclusionPath = $script:Config.TailscaleInstallDir
@@ -653,6 +706,7 @@ function Invoke-Action-InstallTailscale {
                 Installed          = $true
                 InstallerPath      = $installer
                 ExePath            = $exePath
+                TailscaledPath     = $tailscaledPath
                 ServiceName        = if ($svc) { $svc.Name } else { $null }
                 ServiceStatus      = if ($svc) { $svc.Status.ToString() } else { $null }
                 FirewallRules      = @($ruleName)
@@ -686,42 +740,61 @@ function Invoke-Action-UninstallTailscale {
     try {
         $tsState = $h.State.PostHardening.Tailscale
 
-        # Logout first if installed (best-effort)
-        $exe = Join-Path $script:Config.TailscaleInstallDir 'tailscale.exe'
+        # Logout first (best-effort) so the node is removed cleanly from the tailnet
+        $exe = if ($tsState -and $tsState.ExePath) { $tsState.ExePath } else { Join-Path $script:Config.TailscaleInstallDir 'tailscale.exe' }
         if (Test-Path $exe) {
             Start-Process -FilePath $exe -ArgumentList 'logout' -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
         }
 
         $uninstalled = $false
+        $exitCode = -1
+        $msiExitOk = @(0, 1605, 3010)   # 0=ok, 1605=product not installed, 3010=reboot pending
+
+        # 1. If state has the MSI and it is still reachable, msiexec /x <path>
         if ($tsState -and $tsState.InstallerPath -and (Test-Path $tsState.InstallerPath) -and ($tsState.InstallerPath -like '*.msi')) {
-            Invoke-WithMsiAllowed {
-                Start-Process msiexec -ArgumentList @('/x', "`"$($tsState.InstallerPath)`"", '/qn', '/norestart') -Wait
+            $proc = Invoke-WithMsiAllowed {
+                Start-Process msiexec -ArgumentList @('/x', "`"$($tsState.InstallerPath)`"", '/qn', '/norestart') -Wait -PassThru
             }
-            $uninstalled = $true
-        } else {
+            $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+            $uninstalled = ($exitCode -in $msiExitOk)
+        }
+        # 2. Registry uninstall entry (Tailscale MSI registers a ProductCode-keyed entry)
+        if (-not $uninstalled) {
             $u = Get-UninstallEntry -DisplayNamePattern 'Tailscale*'
-            if ($u) {
-                if ($u.QuietUninstallString) {
-                    Start-Process cmd -ArgumentList @('/c', $u.QuietUninstallString) -Wait
-                    $uninstalled = $true
-                } elseif ($u.UninstallString) {
-                    $cmd = $u.UninstallString
-                    if ($cmd -match 'msiexec' -and $cmd -match '({[A-F0-9-]+})') {
-                        $guid = $Matches[1]
-                        Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x',$guid,'/qn','/norestart') -Wait }
-                    } else {
-                        Start-Process cmd -ArgumentList @('/c', "$cmd /S") -Wait
-                    }
-                    $uninstalled = $true
+            if ($u -and ($u.QuietUninstallString -or $u.UninstallString)) {
+                $cmdStr = if ($u.QuietUninstallString) { $u.QuietUninstallString } else { $u.UninstallString }
+                if ($cmdStr -match 'msiexec' -and $cmdStr -match '({[A-F0-9-]+})') {
+                    $guid = $Matches[1]
+                    $proc = Invoke-WithMsiAllowed { Start-Process msiexec -ArgumentList @('/x',$guid,'/qn','/norestart') -Wait -PassThru }
+                    $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+                    $uninstalled = ($exitCode -in $msiExitOk)
+                } else {
+                    # The .exe bootstrapper has no documented silent-uninstall flag.
+                    # Run the registered UninstallString verbatim and accept exit 0.
+                    $proc = Start-Process cmd -ArgumentList @('/c', $cmdStr) -Wait -PassThru -WindowStyle Hidden
+                    $exitCode = if ($proc) { $proc.ExitCode } else { -1 }
+                    $uninstalled = ($exitCode -eq 0)
                 }
             }
         }
 
-        # Remove firewall rules
-        $names = if ($tsState -and $tsState.FirewallRules) { $tsState.FirewallRules } else { @('Tailscale-Direct-UDP') }
-        foreach ($n in $names) { Remove-OutboundAllowRule -Name $n }
+        # Wait for the Tailscale service to disappear
+        $serviceGone = $true
+        $svcName = if ($tsState -and $tsState.ServiceName) { $tsState.ServiceName } else { 'Tailscale' }
+        if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
+            $serviceGone = Wait-ServiceAbsent -ServicePattern $svcName -TimeoutSeconds 30
+            if (-not $serviceGone) {
+                Write-ConsoleLog "[WARN] Tailscale uninstaller returned but '$svcName' service is still present after 30s" 'WARN'
+            }
+        }
 
-        # Remove Defender exclusions
+        # Cleanup firewall + Defender regardless
+        $names = if ($tsState -and $tsState.FirewallRules) {
+            $tsState.FirewallRules
+        } else {
+            @('Tailscale-tailscaled-Outbound','Tailscale-Direct-UDP','Tailscale-Direct-UDP-LocalPort')
+        }
+        foreach ($n in $names) { Remove-OutboundAllowRule -Name $n }
         if ($tsState -and $tsState.DefenderExclusions) {
             foreach ($p in $tsState.DefenderExclusions) {
                 Remove-MpPreference -AttackSurfaceReductionOnlyExclusions $p -ErrorAction SilentlyContinue
@@ -734,10 +807,12 @@ function Invoke-Action-UninstallTailscale {
             $ph.Tailscale = $null
         } | Out-Null
 
-        if ($uninstalled) {
-            return @{ Ok = $true; Message = "Tailscale uninstalled. Firewall + Defender exclusions cleared." }
+        if ($uninstalled -and $serviceGone) {
+            return @{ Ok = $true; Message = "Tailscale uninstalled (exit $exitCode). Firewall + Defender exclusions cleared." }
+        } elseif ($uninstalled) {
+            return @{ Ok = $true; Message = "Tailscale uninstalled (exit $exitCode) but service is still present. May need a reboot. Firewall + Defender cleared." }
         } else {
-            return @{ Ok = $false; Message = "Tailscale uninstaller not found. Cleanup of firewall + Defender done." }
+            return @{ Ok = $false; Message = "Tailscale uninstall did not complete cleanly (exit $exitCode). Firewall + Defender cleaned anyway." }
         }
     } catch {
         return @{ Ok = $false; Message = "Tailscale uninstall failed: $($_.Exception.Message)" }
